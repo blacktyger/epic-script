@@ -141,9 +141,9 @@ OPTIONS
     -c, --component <name>   node | wallet | miner | node_wallet | all
                              Default: node_wallet
     -y, --yes                Do not prompt. Required when piping without a terminal.
-        --install-deps       Install missing system packages with the platform package
-                             manager. Uses sudo on Linux. Off by default: without it, missing
-                             packages are reported with the exact command to run.
+        --install-deps       Approve installing missing build tools without being asked. Only
+                             needed for unattended runs: an interactive run prints the exact
+                             command and offers to run it. Uses sudo on Linux.
         --check              Run the preflight checks and stop. Changes nothing.
         --fast-sync          Download a chain snapshot into ~/.epic/main/chain_data so a new
                              node does not validate from genesis. Node only.
@@ -542,6 +542,25 @@ ensure_rust() {
 # the rest of the file. Read from the terminal instead.
 # ---------------------------------------------------------------------------
 
+# True when a question can actually be answered: either the answer is already known, or there is
+# a terminal to read it from. Separate from confirm() because some callers want to change what
+# they do when nobody can be asked, rather than give up.
+can_prompt() {
+	if [ "$ASSUME_YES" = "1" ]; then
+		return 0
+	fi
+	if [ -t 0 ]; then
+		return 0
+	fi
+	# Piped, so stdin is the script. Reading the terminal directly still works, but only when
+	# there is a human at one. If stdout is redirected as well then nobody is watching, and
+	# /dev/tty can be readable in a CI job that will never type anything.
+	if [ -t 1 ] && [ -r /dev/tty ]; then
+		return 0
+	fi
+	return 1
+}
+
 confirm() {
 	_question="$1"
 
@@ -549,16 +568,10 @@ confirm() {
 		return 0
 	fi
 
-	if [ ! -t 0 ]; then
-		# Piped, so stdin is the script. A prompt can still work by reading the terminal
-		# directly, but only when there is a human at one. If stdout is redirected as well then
-		# nobody is watching, and reading /dev/tty would block forever: /dev/tty can be readable
-		# in a CI job that will never type anything. Refusing is the only safe answer.
-		if [ ! -t 1 ] || [ ! -r /dev/tty ]; then
-			err "cannot prompt, and this needs an answer: $_question
+	if ! can_prompt; then
+		err "cannot prompt, and this needs an answer: $_question
     There is no terminal attached, which is normal when piping into sh from a script or CI.
     Rerun with --yes, or set EPIC_YES=1, to accept without prompting."
-		fi
 	fi
 
 	printf '%s [y/N] ' "$_question"
@@ -1431,12 +1444,51 @@ report_and_install_deps() {
 
 	_pkgs="$(pkg_list)"
 
-	if [ -z "$PKG_MGR" ] || [ -z "$_pkgs" ]; then
-		if [ "$PLATFORM" = "macos" ]; then
-			err "no Homebrew found, so the missing libraries cannot be named as packages.
-    Install Homebrew from https://brew.sh and rerun, or install cmake, pkg-config, ncurses,
-    zlib and openssl@3 by hand."
+	# macOS needs two things before packages can be named at all, and both can be offered rather
+	# than turned into a dead end.
+	if [ "$PLATFORM" = "macos" ]; then
+		# The compiler and headers come from the command line tools, and the system has its own
+		# installer for them, so trigger that rather than describing it.
+		if ! xcode-select -p >/dev/null 2>&1; then
+			say_bare "The Xcode command line tools are missing. They provide the C compiler and headers."
+			say_bare "    xcode-select --install"
+			say_bare ""
+			if can_prompt && confirm "Start the Xcode command line tools installer now?"; then
+				ignore xcode-select --install
+				err "the tools installer runs in its own window. Let it finish, then rerun this script."
+			fi
+			err "the Xcode command line tools are required. Run xcode-select --install, then rerun."
 		fi
+
+		if [ -z "$PKG_MGR" ]; then
+			say_bare "Homebrew is missing, and it is how the remaining libraries get installed."
+			say_bare "    /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+			say_bare ""
+			if can_prompt && confirm "Install Homebrew now, from brew.sh?"; then
+				need_cmd curl
+				ensure /bin/bash -c \
+					"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+				# Homebrew puts itself on PATH through a shell profile, which this shell has
+				# already read, so its own shellenv is the way to see it now.
+				for _brew in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+					if [ -x "$_brew" ]; then
+						eval "$("$_brew" shellenv)"
+						break
+					fi
+				done
+				detect_pkg_mgr
+				setup_macos_env
+				_pkgs="$(pkg_list)"
+			fi
+			if [ -z "$PKG_MGR" ]; then
+				err "Homebrew is required to install the remaining libraries.
+    Install it from https://brew.sh and rerun, or install cmake, pkg-config, ncurses, zlib and
+    openssl@3 by hand."
+			fi
+		fi
+	fi
+
+	if [ -z "$PKG_MGR" ] || [ -z "$_pkgs" ]; then
 		err "could not identify this system's package manager, so the packages cannot be named.
     Install the equivalents of: a C toolchain, cmake, git, pkg-config, libclang, and the
     development headers for ncurses, zlib and openssl. Then rerun."
@@ -1446,23 +1498,34 @@ report_and_install_deps() {
 	say_bare "    $PKG_INSTALL_CMD $_pkgs"
 	say_bare ""
 
+	# Offer, rather than refuse. Refusing and telling the reader to rerun with a flag made them
+	# run the whole preflight twice to get to the same place, when the answer to "may I" is the
+	# only thing that was missing.
+	#
+	# --install-deps still exists, because a run with no terminal cannot be asked. The split is
+	# deliberate: an unattended pipe never escalates on its own, an interactive one just asks.
 	if [ "$INSTALL_DEPS" != "1" ]; then
-		err "stopping, because installing system packages needs your say-so.
-    Run the command above yourself, or rerun this installer with --install-deps."
-	fi
-
-	if [ "$PKG_MGR" != "brew" ]; then
-		say "--install-deps was passed, so this will run with sudo and may ask for your password."
-	fi
-	if ! confirm "Run: $PKG_INSTALL_CMD $_pkgs ?"; then
-		err "declined. Install the packages above and rerun."
+		if ! can_prompt; then
+			err "these need installing first, and there is no terminal here to ask on.
+    Run the command above yourself, or rerun with --install-deps to allow it."
+		fi
+		if [ "$PKG_MGR" != "brew" ]; then
+			say_bare "This runs with sudo, so it may ask for your password."
+			say_bare ""
+		fi
+		if ! confirm "Install them now?"; then
+			err "declined, nothing was changed. Install the packages above and rerun."
+		fi
+		INSTALL_DEPS=1
 	fi
 
 	# Refresh the apt index first, or install fails on a stale one.
 	if [ "$PKG_MGR" = "apt" ]; then
+		say "refreshing the package index"
 		ensure sudo apt-get update
 	fi
 
+	say "installing: $_pkgs"
 	# shellcheck disable=SC2086
 	# Both are intentionally word-split into separate arguments.
 	ensure $PKG_INSTALL_CMD $_pkgs

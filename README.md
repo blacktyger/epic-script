@@ -118,8 +118,9 @@ into `~/.epic/miner` and reached through a small launcher on your PATH that supp
 
 ## What it will not do
 
-- **No sudo of its own.** Binaries go under your home directory. System packages are only installed
-  if you pass `--install-deps`, and the exact command is printed first.
+- **No sudo without asking.** Binaries go under your home directory. If build tools are missing it
+  prints the exact command, then asks. Answer no and nothing is changed. An unattended run with no
+  terminal to ask on refuses instead of escalating, which is what `--install-deps` is for.
 - **It never creates a wallet.** `epic-wallet init` generates a seed phrase, so that stays your
   explicit step. The installer will not run it for you.
 - **It never touches wallet data.** No file under `~/.epic/*/wallet_data` is read, moved or removed.
@@ -164,8 +165,14 @@ used and the snapshot is ignored.
 
 ## Build requirements
 
-The installer checks all of these and prints the exact install command for your platform when
-something is missing. You do not need to read this section unless a check fails.
+The installer checks all of these, prints the exact install command for your platform, and offers
+to run it. You do not need to read this section unless you want to install them yourself.
+
+On Windows that includes the Visual Studio Build Tools with the C++ workload, passed through winget
+with the `--override` it needs. Without that override winget installs the VS Installer and no
+workload, which yields no compiler while appearing to succeed. On macOS it will trigger
+`xcode-select --install` and offer to install Homebrew, since neither can be named as a package until
+they exist.
 
 **Linux.** A C toolchain, CMake, git, pkg-config, libclang, and development headers for ncurses,
 zlib and OpenSSL. On Debian and Ubuntu:

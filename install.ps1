@@ -35,8 +35,8 @@
     Do not prompt.
 
 .PARAMETER InstallDeps
-    Install missing build tools with winget. Off by default: without it, missing tools are
-    reported with the exact command to run.
+    Approve installing missing build tools without being asked. Only needed for unattended runs:
+    an interactive run prints the exact winget command for each one and offers to run it.
 
 .PARAMETER Check
     Run the preflight checks and stop. Changes nothing.
@@ -425,6 +425,36 @@ function Find-StrawberryPerl {
 # Preflight
 # ---------------------------------------------------------------------------
 
+# The exact winget command for one entry, so what is printed is what runs.
+#
+# --override is passed through for Visual Studio Build Tools. Without it winget installs the VS
+# Installer and no workload at all, which produces no compiler while looking like it succeeded.
+function Get-WingetCommand($Entry) {
+    $cmd = "winget install --accept-package-agreements --accept-source-agreements --id $($Entry.Winget)"
+    if ($Entry.Override) { $cmd += " --override `"$($Entry.Override)`"" }
+    return $cmd
+}
+
+function Invoke-WingetInstall($Entry) {
+    # Not named $args: that is an automatic variable, and assigning to it inside a function is a
+    # trap even where it happens to work.
+    $wingetArgs = @(
+        'install'
+        '--accept-package-agreements'
+        '--accept-source-agreements'
+        '--id', $Entry.Winget
+    )
+    if ($Entry.Override) { $wingetArgs += @('--override', $Entry.Override) }
+
+    & winget @wingetArgs
+    if ($LASTEXITCODE -ne 0) {
+        # Not fatal on its own: the rest of the list is still worth attempting, and the rerun
+        # re-checks everything anyway, so a genuinely missing tool is caught then rather than
+        # guessed at now.
+        Write-Warn "winget returned $LASTEXITCODE for $($Entry.Winget). Continuing with the rest."
+    }
+}
+
 function Invoke-Preflight {
     $missing = @()
 
@@ -433,6 +463,8 @@ function Invoke-Preflight {
 
     $script:LibClangPath = Find-LibClang
     if (-not $script:LibClangPath) {
+        # The LLVM component bundled with Visual Studio ships only clang-format and clang-tidy, so
+        # a separate LLVM install is what the bindgen crates need.
         $missing += @{ Name = 'LLVM (for libclang.dll)'; Winget = 'LLVM.LLVM' }
     }
 
@@ -443,76 +475,88 @@ function Invoke-Preflight {
         }
     }
 
+    # The MSVC toolchain joins the same list rather than being a separate hard error. It needs
+    # --override because the bare Build Tools package installs an installer with no workload, which
+    # produces no compiler and looks like the install worked.
+    $vs = Find-VisualStudio
+    if (-not $vs) {
+        $missing += @{
+            Name     = 'Visual Studio Build Tools, C++ workload'
+            Winget   = 'Microsoft.VisualStudio.2022.BuildTools'
+            Override = '--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+            Note     = 'Several GB, and it brings a current Windows SDK with it.'
+        }
+    }
+
+    # Only worth offering separately when the compiler is already here. When Build Tools is being
+    # installed above, --includeRecommended brings an SDK newer than the floor anyway.
+    $sdk = if ($vs) { Get-NewestWindowsSdk } else { $null }
+    if ($vs -and (-not $sdk -or $sdk -lt $MinWindowsSdk)) {
+        $missing += @{
+            Name   = "Windows SDK $MinWindowsSdk or newer (found $(if ($sdk) { $sdk } else { 'none' }))"
+            Winget = 'Microsoft.WindowsSDK.10.0.22621'
+            Note   = "croaring-sys compiles with -std:c11 and needs stdalign.h, which MSVC only ships from $MinWindowsSdk onward. If winget cannot find this package, add it through the Visual Studio Installer under Individual Components."
+        }
+    }
+
     if ($missing.Count -gt 0) {
         Write-Plain ''
         Write-Info 'missing build tools:'
-        foreach ($m in $missing) { Write-Plain "  $($m.Name)" }
-        Write-Plain ''
-
-        $ids = ($missing | ForEach-Object { $_.Winget }) -join ' '
-        Write-Plain 'Install them with:'
-        Write-Plain "    winget install --accept-package-agreements --accept-source-agreements $ids"
-        Write-Plain ''
-
-        if (-not $script:InstallDeps) {
-            Stop-WithError @"
-stopping, because installing build tools needs your say-so.
-    Run the command above yourself, or rerun this installer with -InstallDeps.
-"@
+        foreach ($m in $missing) {
+            Write-Plain "  $($m.Name)"
+            if ($m.Note) { Write-Plain "    $($m.Note)" }
         }
-        if (-not (Test-Command 'winget')) {
+        Write-Plain ''
+
+        # One command per package rather than one line with every id. winget's positional argument
+        # is a single query, so a multi-package line is not something to hand a reader as a
+        # copy-paste, and printing exactly what runs matters more than printing it compactly.
+        Write-Plain 'Install them with:'
+        foreach ($m in $missing) { Write-Plain "    $(Get-WingetCommand $m)" }
+        Write-Plain ''
+
+        # Offer, rather than refuse. Refusing and telling the reader to rerun with a switch made
+        # them sit through the whole preflight twice to reach the same point, when permission was
+        # the only thing missing. -InstallDeps still exists for runs with no console to ask on.
+        if (-not $script:InstallDeps) {
+            if (-not (Test-CanPrompt)) {
+                Stop-WithError @"
+these need installing first, and there is no console here to ask on.
+    Run the commands above yourself, or rerun with -InstallDeps to allow it.
+"@
+            }
+            if (-not (Test-Command 'winget')) {
+                Stop-WithError @"
+winget is not available, so these cannot be installed automatically.
+    Install them by hand, or get App Installer from the Microsoft Store, then rerun.
+"@
+            }
+            Write-Plain 'winget may show a UAC prompt for each one.'
+            Write-Plain ''
+            if (-not (Confirm-Action 'Install them now?')) {
+                Stop-WithError 'declined, nothing was changed. Install the tools above and rerun.'
+            }
+        } elseif (-not (Test-Command 'winget')) {
             Stop-WithError @"
 winget is not available, so the tools cannot be installed automatically.
     Install them by hand, or get App Installer from the Microsoft Store, then rerun.
 "@
         }
-        if (-not (Confirm-Action "Install with winget: $ids ?")) {
-            Stop-WithError 'declined. Install the tools above and rerun.'
-        }
 
         foreach ($m in $missing) {
             Write-Info "installing $($m.Name)"
-            & winget install --accept-package-agreements --accept-source-agreements --id $m.Winget
+            Invoke-WingetInstall $m
         }
 
         Write-Plain ''
         Stop-WithError @"
-build tools were installed, but this shell's PATH predates them.
-    Open a new terminal and rerun this installer. That is a PATH refresh, not a failure.
+build tools were installed, but this shell's PATH and environment predate them.
+    Open a new terminal and rerun this installer. That is a refresh, not a failure.
 "@
     }
 
-    # The MSVC toolchain cannot be installed sensibly from a one-liner, so it is reported
-    # rather than automated.
-    $vs = Find-VisualStudio
-    if (-not $vs) {
-        Stop-WithError @"
-no Visual Studio C++ toolchain found, and Rust's default Windows target needs the MSVC linker.
-
-    Install the Build Tools with the native desktop workload:
-
-        winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-
-    Or download them from https://visualstudio.microsoft.com/downloads/ and pick
-    "Desktop development with C++". Then open a new terminal and rerun.
-"@
-    }
     Write-Info "MSVC toolchain: $vs"
-
-    $sdk = Get-NewestWindowsSdk
-    if (-not $sdk) {
-        Write-Warn 'no Windows SDK found under Windows Kits\10\Include. The build will probably fail to find headers.'
-    } elseif ($sdk -lt $MinWindowsSdk) {
-        Stop-WithError @"
-Windows SDK $sdk is too old. The croaring-sys crate compiles with -std:c11 and needs
-    stdalign.h, which MSVC only ships from SDK $MinWindowsSdk onward. On $sdk the build fails
-    with "Cannot open include file: 'stdalign.h'".
-
-    Add a newer SDK through the Visual Studio Installer, under Individual Components, then rerun.
-"@
-    } else {
-        Write-Info "Windows SDK: $sdk"
-    }
+    Write-Info "Windows SDK: $(if ($sdk) { $sdk } else { Get-NewestWindowsSdk })"
 
     Write-Info "libclang: $($script:LibClangPath)"
     if (Test-WantMiner) { Write-Info "perl: $($script:PerlPath)" }
@@ -715,22 +759,26 @@ function Invoke-Download([string]$Url, [string]$Destination) {
 # Prompting
 # ---------------------------------------------------------------------------
 
+# True when a question can actually be answered. Separate from Confirm-Action because some callers
+# want to change what they do when nobody can be asked, rather than give up.
+function Test-CanPrompt {
+    if ($script:Yes) { return $true }
+    try {
+        if (-not [Environment]::UserInteractive) { return $false }
+        if ([Console]::IsInputRedirected) { return $false }
+    } catch {
+        return $false
+    }
+    return $true
+}
+
 function Confirm-Action([string]$Question) {
     if ($script:Yes) { return $true }
 
     # Fetched with irm and run through iex, stdin is still the console, so Read-Host works. The
     # case to guard is a genuinely non-interactive session, where prompting would either throw or
     # block forever. Both checks are needed: UserInteractive is true in plenty of CI containers.
-    $interactive = $true
-    try {
-        if (-not [Environment]::UserInteractive) { $interactive = $false }
-        if ([Console]::IsInputRedirected) { $interactive = $false }
-    } catch {
-        # An unusual host that cannot answer the question. Treat it as non-interactive.
-        $interactive = $false
-    }
-
-    if (-not $interactive) {
+    if (-not (Test-CanPrompt)) {
         Stop-WithError @"
 cannot prompt, and this needs an answer: $Question
     There is no interactive console attached, which is normal in CI.
