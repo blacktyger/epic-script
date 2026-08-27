@@ -310,6 +310,9 @@ OPTIONS
         --no-modify-path     Do not touch shell startup files.
         --no-patch-cmake     Refuse the miner's two build-script fixes rather than applying
                              them. The miner will not build on a current CMake without them.
+        --force-checkout     Discard uncommitted changes in an existing source checkout.
+                             Without it, a checkout with local edits stops the run rather
+                             than being overwritten.
     -h, --help               This text.
     -V, --version            Installer version.
 
@@ -318,7 +321,7 @@ ENVIRONMENT
 
     EPIC_COMPONENT, EPIC_YES, EPIC_INSTALL_DEPS, EPIC_CHECK_ONLY, EPIC_WITH_TOR,
     EPIC_MINER_FEATURES, EPIC_BIN_DIR, EPIC_SRC_DIR, EPIC_JOBS, EPIC_NO_MODIFY_PATH,
-    EPIC_NO_PATCH_CMAKE, EPIC_FAST_SYNC, EPIC_BOOTSTRAP_URL
+    EPIC_NO_PATCH_CMAKE, EPIC_FORCE_CHECKOUT, EPIC_FAST_SYNC, EPIC_BOOTSTRAP_URL
 
     Set boolean ones to 1. For example:
 
@@ -771,13 +774,76 @@ want_miner() {
 
 # Clone at an exact ref, or update an existing checkout to it. Kept shallow where possible,
 # because nobody needs the full history to compile a tag.
+# Paths this installer modifies inside a checkout itself. Excluded from the uncommitted-changes
+# check below, or the miner's own cmake fix would look like the user's work on every rerun.
+INSTALLER_PATCHED_PATHS="cuckoo-miner/src/build.rs randomx-rust/build.rs"
+
+# Refuse to throw away work that is not ours.
+#
+# The update path ends in `git checkout --force`, which discards uncommitted changes to tracked
+# files. That is fine for a checkout this script created and nobody has touched. It is data loss
+# for someone who pointed --src-dir at a clone they were editing, and nothing warned them.
+#
+# Only tracked modifications matter: --force leaves untracked files alone, and it cannot lose
+# commits, since the ref stays reachable. So untracked files are not counted, and neither are the
+# two build scripts this installer patches itself.
+assert_checkout_is_clean() {
+	_dir="$1"
+	_name="$2"
+
+	_dirty="$(git -C "$_dir" status --porcelain --untracked-files=no 2>/dev/null || true)"
+	[ -n "$_dirty" ] || return 0
+
+	# Drop our own edits from the list, then see whether anything is left.
+	# Strip the two-character status column and its space, leaving the path.
+	_theirs=""
+	echo "$_dirty" | while IFS= read -r _line; do
+		[ -n "$_line" ] || continue
+		printf '%s\n' "${_line#???}"
+	done >"$WORK_TMP/dirty.txt"
+
+	while IFS= read -r _path; do
+		[ -n "$_path" ] || continue
+		_ours=0
+		for _known in $INSTALLER_PATCHED_PATHS; do
+			[ "$_path" = "$_known" ] && _ours=1
+		done
+		[ "$_ours" = "1" ] || _theirs="$_theirs $_path"
+	done <"$WORK_TMP/dirty.txt"
+
+	[ -n "$_theirs" ] || return 0
+
+	if [ "$FORCE_CHECKOUT" = "1" ]; then
+		warn "discarding uncommitted changes in $_dir, because --force-checkout was passed"
+		return 0
+	fi
+
+	err "$_name at $_dir has uncommitted changes to tracked files:
+$(for _f in $_theirs; do printf '          %s\n' "$_f"; done)
+        Updating it to the pinned ref runs git checkout --force, which discards those.
+
+        Commit or stash them, or point somewhere else with --src-dir, or pass
+        --force-checkout to discard them deliberately."
+}
+
 fetch_source() {
 	_repo="$1"
 	_dir="$SRC_DIR/$2"
 	_ref="$3"
 	_recursive="$4"
 
+	# A directory that is not a checkout cannot be cloned into, and git's own message for it does
+	# not say what to do about it.
+	if [ -d "$_dir" ] && [ ! -d "$_dir/.git" ]; then
+		if [ -n "$(ls -A "$_dir" 2>/dev/null)" ]; then
+			err "$_dir already exists, is not a git checkout, and is not empty.
+        This installer needs that path for the $2 sources. Move it aside, or choose a
+        different tree with --src-dir."
+		fi
+	fi
+
 	if [ -d "$_dir/.git" ]; then
+		assert_checkout_is_clean "$_dir" "$2"
 		# An existing checkout may point somewhere else, either from an older version of this
 		# installer or from the user's own clone. Fetching without fixing that would look for
 		# the pinned ref in the wrong repository and fail with a confusing checkout error.
@@ -924,9 +990,49 @@ install_binary() {
 	_name="$2"
 
 	[ -f "$_src" ] || err "expected a built binary at $_src and it is not there"
+
+	# Say what is being replaced. Overwriting silently is fine until the version that was there
+	# mattered, and by then it is gone.
+	if [ -f "$BIN_DIR/$_name" ]; then
+		_was="$("$BIN_DIR/$_name" --version 2>/dev/null | head -n 1 || true)"
+		detail "replacing ${_was:-an existing $_name} at $BIN_DIR/$_name"
+	fi
+
 	ensure install -m 755 "$_src" "$BIN_DIR/$_name"
 	record "$BIN_DIR/$_name"
 	say "installed $BIN_DIR/$_name"
+}
+
+# Warn when a different binary of the same name will win on PATH.
+#
+# Verification runs $BIN_DIR/<name> by absolute path, so it reports success for a binary the user
+# may never reach: an older epic from a 3.x .deb in /usr/local/bin still answers to `epic`. The
+# check runs against the PATH the user's shell will have, not the one this run prepended to, or it
+# would only ever find our own copy.
+warn_if_shadowed() {
+	_name="$1"
+	_first=""
+
+	_ifs_saved="$IFS"
+	IFS=':'
+	# shellcheck disable=SC2086
+	# ORIG_PATH is deliberately word-split on the colon set above.
+	for _d in $ORIG_PATH; do
+		[ -n "$_d" ] || continue
+		if [ -x "$_d/$_name" ]; then
+			_first="$_d/$_name"
+			break
+		fi
+	done
+	IFS="$_ifs_saved"
+
+	[ -n "$_first" ] || return 0
+	[ "$_first" != "$BIN_DIR/$_name" ] || return 0
+
+	_other="$("$_first" --version 2>/dev/null | head -n 1 || true)"
+	warn "$_name on your PATH is $_first${_other:+ ($_other)}, not the one just installed.
+        That one wins, because its directory comes first. Remove it, or put $BIN_DIR
+        earlier in PATH, or call $BIN_DIR/$_name by its full path."
 }
 
 # The miner is not a single binary. It loads RandomX as a shared library, needs its Cuckoo
@@ -1376,7 +1482,11 @@ if [ "\$PURGE" = "1" ]; then
 	printf 'This deletes wallet seeds and cannot be undone. Type DELETE to confirm: '
 	read -r _c
 	if [ "\$_c" = "DELETE" ]; then
-		rm -rf "$HOME/.epic/main" "$HOME/.epic/floonet" "$HOME/.epic/usernet" "$SRC_DIR"
+		# Chain data lives in \$HOME/.epic/<shortname>, and the shortnames are not the network
+		# names: epic-server/core/src/global.rs:131 maps Mainnet to main, Floonet to floo,
+		# UserTesting to user and AutomatedTesting to auto. Naming them floonet and usernet
+		# left every non-mainnet chain and its wallets in place after a purge.
+		rm -rf "$HOME/.epic/main" "$HOME/.epic/floo" "$HOME/.epic/user" "$HOME/.epic/auto" "$SRC_DIR"
 		say "removed chain data, wallets and sources"
 	else
 		say "left your data alone"
@@ -1427,8 +1537,13 @@ verify_install() {
 
 	if [ -n "$_failed" ]; then
 		err "installed but could not run:$_failed
-    Run the binary directly to see the loader or library error."
+        Run the binary directly to see the loader or library error."
 	fi
+
+	want_node && warn_if_shadowed "$NODE_BIN"
+	want_wallet && warn_if_shadowed "$WALLET_BIN"
+	want_miner && warn_if_shadowed "$MINER_BIN"
+	return 0
 }
 
 next_steps() {
@@ -1555,6 +1670,10 @@ parse_args() {
 			;;
 		--no-patch-cmake)
 			NO_PATCH_CMAKE=1
+			shift
+			;;
+		--force-checkout)
+			FORCE_CHECKOUT=1
 			shift
 			;;
 		--fast-sync)
@@ -1769,6 +1888,7 @@ main() {
 	JOBS="${EPIC_JOBS:-}"
 	NO_MODIFY_PATH="${EPIC_NO_MODIFY_PATH:-0}"
 	NO_PATCH_CMAKE="${EPIC_NO_PATCH_CMAKE:-0}"
+	FORCE_CHECKOUT="${EPIC_FORCE_CHECKOUT:-0}"
 	FAST_SYNC="${EPIC_FAST_SYNC:-0}"
 	BOOTSTRAP_URL="${EPIC_BOOTSTRAP_URL:-$BOOTSTRAP_URL_DEFAULT}"
 	FAST_SYNC_STATUS="not requested"
@@ -1780,6 +1900,9 @@ main() {
 	RUSTUP_WAS_INSTALLED=0
 
 	setup_style
+	# Captured before setup_path prepends to PATH, so the shadowing check can ask what the
+	# user's own shell would resolve rather than what this run arranged.
+	ORIG_PATH="$PATH"
 	parse_args "$@"
 	validate_component
 

@@ -63,6 +63,10 @@
     Refuse the miner's two build-script fixes rather than applying them. The miner will not
     build on a current CMake without them.
 
+.PARAMETER ForceCheckout
+    Discard uncommitted changes in an existing source checkout. Without it, a checkout with local
+    edits stops the run rather than being overwritten.
+
 .PARAMETER FastSync
     Download a chain snapshot into %USERPROFILE%\.epic\main\chain_data so a new node does not
     validate from genesis. Node only.
@@ -76,7 +80,7 @@
     Environment variable equivalents, which are the easier route through a pipe:
     EPIC_COMPONENT, EPIC_YES, EPIC_INSTALL_DEPS, EPIC_CHECK_ONLY, EPIC_WITH_TOR,
     EPIC_MINER_FEATURES, EPIC_BIN_DIR, EPIC_SRC_DIR, EPIC_JOBS, EPIC_NO_MODIFY_PATH,
-    EPIC_NO_PATCH_CMAKE, EPIC_FAST_SYNC, EPIC_BOOTSTRAP_URL
+    EPIC_NO_PATCH_CMAKE, EPIC_FORCE_CHECKOUT, EPIC_FAST_SYNC, EPIC_BOOTSTRAP_URL
 
     This script never installs anything system-wide on its own. Binaries go under your own
     profile, and build tools are only installed if you pass -InstallDeps.
@@ -99,6 +103,7 @@ param(
     [switch]$NoModifyPath,
     [switch]$NoPatchCmake,
     [switch]$FastSync,
+    [switch]$ForceCheckout,
     [string]$BootstrapUrl
 )
 
@@ -130,6 +135,7 @@ $script:OptWithTor = [bool]$WithTor
 $script:OptNoModifyPath = [bool]$NoModifyPath
 $script:OptNoPatchCmake = [bool]$NoPatchCmake
 $script:OptFastSync = [bool]$FastSync
+$script:OptForceCheckout = [bool]$ForceCheckout
 
 $InstallerVersion = '1.0.0'
 
@@ -355,6 +361,7 @@ function Resolve-Settings {
     $script:NoModifyPath = $script:OptNoModifyPath -or ($env:EPIC_NO_MODIFY_PATH -eq '1')
     $script:NoPatchCmake = $script:OptNoPatchCmake -or ($env:EPIC_NO_PATCH_CMAKE -eq '1')
     $script:FastSync = $script:OptFastSync -or ($env:EPIC_FAST_SYNC -eq '1')
+    $script:ForceCheckout = $script:OptForceCheckout -or ($env:EPIC_FORCE_CHECKOUT -eq '1')
 
     # Checked here rather than with a [ValidateSet] attribute, which cannot be applied under iex.
     $valid = @('node', 'wallet', 'miner', 'node_wallet', 'all')
@@ -921,11 +928,64 @@ cannot prompt, and this needs an answer: $Question
 # Source and build
 # ---------------------------------------------------------------------------
 
+# Paths this installer modifies inside a checkout itself. Excluded from the uncommitted-changes
+# check below, or the miner's own cmake fix would look like the user's work on every rerun.
+$InstallerPatchedPaths = @('cuckoo-miner/src/build.rs', 'randomx-rust/build.rs')
+
+# Refuse to throw away work that is not ours.
+#
+# The update path ends in `git checkout --force`, which discards uncommitted changes to tracked
+# files. Fine for a checkout this script created and nobody touched, data loss for someone who
+# pointed -SrcDir at a clone they were editing.
+#
+# Only tracked modifications matter: --force leaves untracked files alone and cannot lose commits,
+# since the ref stays reachable.
+function Assert-CheckoutIsClean([string]$Directory, [string]$Name) {
+    $dirty = & git -C $Directory status --porcelain --untracked-files=no 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $dirty) { return }
+
+    $theirs = @()
+    foreach ($line in @($dirty)) {
+        if (-not $line) { continue }
+        $path = $line.Substring(3).Trim()
+        if ($InstallerPatchedPaths -notcontains $path) { $theirs += $path }
+    }
+    if ($theirs.Count -eq 0) { return }
+
+    if ($script:ForceCheckout) {
+        Write-Warn "discarding uncommitted changes in $Directory, because -ForceCheckout was passed"
+        return
+    }
+
+    $list = ($theirs | ForEach-Object { "          $_" }) -join "`n"
+    Stop-WithError @"
+$Name at $Directory has uncommitted changes to tracked files:
+$list
+        Updating it to the pinned ref runs git checkout --force, which discards those.
+
+        Commit or stash them, or point somewhere else with -SrcDir, or pass
+        -ForceCheckout to discard them deliberately.
+"@
+}
+
 function Get-Source([hashtable]$Source, [bool]$Recursive) {
     $dir = Join-Path $script:SrcDir $Source.Dir
 
+    # A directory that is not a checkout cannot be cloned into, and git's own message for it does
+    # not say what to do about it.
+    if ((Test-Path $dir) -and -not (Test-Path (Join-Path $dir '.git'))) {
+        if (@(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+            Stop-WithError @"
+$dir already exists, is not a git checkout, and is not empty.
+        This installer needs that path for the $($Source.Dir) sources. Move it aside, or choose
+        a different tree with -SrcDir.
+"@
+        }
+    }
+
     $log = Join-Path $script:LogDir "fetch-$($Source.Dir).log"
     if (Test-Path (Join-Path $dir '.git')) {
+        Assert-CheckoutIsClean -Directory $dir -Name $Source.Dir
         $code = Invoke-Logged -Label "updating $($Source.Dir) to $($Source.Ref)" -LogPath $log `
             -Exe 'git' -Arguments @('-C', $dir, 'fetch', '--tags', '--force', 'origin')
         if ($code -ne 0) { Show-LogTail $log; Stop-WithError "git fetch failed in $dir. Full log: $log" }
@@ -1029,7 +1089,23 @@ function Install-ComponentBinary([string]$Name) {
     }
 
     $target = Join-Path $script:BinDir $source.Bin
-    Copy-Item -LiteralPath $built -Destination $target -Force
+
+    # Say what is being replaced. Overwriting silently is fine until the version that was there
+    # mattered, and by then it is gone.
+    if (Test-Path $target) {
+        $was = $null
+        try { $was = (& $target --version 2>$null | Select-Object -First 1) } catch { $was = $null }
+        Write-Detail "replacing $(if ($was) { $was } else { "an existing $($source.Bin)" }) at $target"
+    }
+
+    try {
+        Copy-Item -LiteralPath $built -Destination $target -Force
+    } catch [System.UnauthorizedAccessException] {
+        Stop-WithError @"
+could not replace $target, which usually means it is running.
+        Stop the running $($source.Bin) and rerun.
+"@
+    }
     Add-Receipt $target
     Write-Info "installed $target"
 }
@@ -1420,7 +1496,11 @@ function Write-Uninstaller {
     $lines.Add('    Write-Host ''This deletes wallet seeds and cannot be undone.''')
     $lines.Add('    $c = Read-Host ''Type DELETE to confirm''')
     $lines.Add('    if ($c -eq ''DELETE'') {')
-    $lines.Add("        foreach (`$d in @('main','floonet','usernet')) {")
+    # Chain data lives in %USERPROFILE%\.epic\<shortname>, and the shortnames are not the network
+    # names: epic-server/core/src/global.rs:131 maps Mainnet to main, Floonet to floo, UserTesting
+    # to user and AutomatedTesting to auto. Naming them floonet and usernet left every non-mainnet
+    # chain and its wallets in place after a purge.
+    $lines.Add("        foreach (`$d in @('main','floo','user','auto')) {")
     $lines.Add('            Remove-Item -LiteralPath (Join-Path $env:USERPROFILE ".epic\$d") -Recurse -Force -ErrorAction SilentlyContinue')
     $lines.Add('        }')
     $lines.Add("        Remove-Item -LiteralPath '$($script:SrcDir)' -Recurse -Force -ErrorAction SilentlyContinue")
@@ -1446,6 +1526,32 @@ function Write-Uninstaller {
 # Verification
 # ---------------------------------------------------------------------------
 
+# Warn when a different binary of the same name will win on PATH.
+#
+# Verification runs the installed binary by full path, so it reports success for something the user
+# may never reach: an older epic.exe from an earlier download still answers to `epic`. Checked
+# against the PATH the user's shell will have, not the one this run prepended to.
+function Write-ShadowWarning([string]$Name) {
+    $first = $null
+    foreach ($dir in ($script:OrigPath -split ';')) {
+        if (-not $dir) { continue }
+        if (Test-FileAt $dir $Name) {
+            $first = [System.IO.Path]::Combine($dir, $Name)
+            break
+        }
+    }
+    if (-not $first) { return }
+    if ($first -eq (Join-Path $script:BinDir $Name)) { return }
+
+    $other = $null
+    try { $other = (& $first --version 2>$null | Select-Object -First 1) } catch { $other = $null }
+    Write-Warn @"
+$Name on your PATH is $first$(if ($other) { " ($other)" }), not the one just installed.
+        That one wins, because its directory comes first. Remove it, or put $($script:BinDir)
+        earlier in PATH, or call it by its full path.
+"@
+}
+
 # An install is not finished because the copy succeeded. Run each binary and show its version.
 function Test-Install {
     $failed = @()
@@ -1468,8 +1574,13 @@ function Test-Install {
     if ($failed.Count -gt 0) {
         Stop-WithError @"
 installed but could not run: $($failed -join ', ')
-    Run the binary directly to see the loader or DLL error.
+        Run the binary directly to see the loader or DLL error.
 "@
+    }
+
+    foreach ($name in Get-SelectedComponents) {
+        $leaf = if ($name -eq 'miner') { 'epic-miner.cmd' } else { $Sources[$name].Bin }
+        Write-ShadowWarning $leaf
     }
 }
 
@@ -1561,6 +1672,9 @@ function Invoke-Main {
     $script:FastSyncStatus = 'not requested'
 
     Initialize-Style
+    # Captured before Add-ToUserPath prepends, so the shadowing check asks what the user's own
+    # shell would resolve rather than what this run arranged.
+    $script:OrigPath = $env:PATH
     Assert-PowerShellVersion
     Resolve-Settings
     $script:HostArch = Get-HostArchitecture

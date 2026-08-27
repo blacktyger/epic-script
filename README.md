@@ -99,6 +99,7 @@ curl -fsSL .../install.sh | EPIC_COMPONENT=node EPIC_YES=1 sh
 | `--jobs <n>` | `EPIC_JOBS` | Parallel build jobs |
 | `--no-modify-path` | `EPIC_NO_MODIFY_PATH` | Leave shell startup files and PATH alone |
 | `--no-patch-cmake` | `EPIC_NO_PATCH_CMAKE` | Refuse the miner build-script fixes described below |
+| `--force-checkout` | `EPIC_FORCE_CHECKOUT` | Discard uncommitted changes in an existing source checkout |
 
 ## What it installs
 
@@ -126,6 +127,26 @@ into `~/.epic/miner` and reached through a small launcher on your PATH that supp
 - **It never touches wallet data.** No file under `~/.epic/*/wallet_data` is read, moved or removed.
 - **It will not silently replace chain data.** `--fast-sync` asks before replacing an existing
   chain, and moves the old one aside with a timestamp rather than deleting it.
+- **It will not discard your work.** Updating a source checkout ends in `git checkout --force`, so a
+  checkout with uncommitted changes to tracked files stops the run. Commit them, point `--src-dir`
+  elsewhere, or pass `--force-checkout` to discard them deliberately. The two build scripts the
+  installer patches itself are not counted, so a rerun is not blocked by its own edit.
+
+## If you already have Epic installed
+
+Rerunning is safe and idempotent, and it says what it is doing rather than assuming.
+
+An existing checkout at the source path is reused rather than recloned, and its `origin` is
+repointed if it aims somewhere else. A directory that exists but is not a checkout stops the run with
+a message naming it, instead of git's "already exists and is not an empty directory".
+
+Before replacing a binary it prints what was there, with its version, so a downgrade is visible
+rather than silent. Your `epic-miner.toml` is kept if you already have one.
+
+After installing it checks whether a different binary of the same name comes first on your `PATH`,
+which is the case that used to look like success and behave like failure: an older `epic` from a 3.x
+`.deb` in `/usr/local/bin` still answers to `epic` even though the new one installed correctly. If
+that happens you are told which file wins and where it is.
 
 ## Uninstall
 
