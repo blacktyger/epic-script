@@ -82,12 +82,29 @@ Every option has a variable equivalent, which also works on Unix and is the easi
 curl -fsSL .../install.sh | EPIC_COMPONENT=node EPIC_YES=1 sh
 ```
 
+## Answering the questions
+
+It asks before doing anything you might not want: installing build tools, installing Rust, patching
+the miner's build scripts, replacing chain data. Each prompt takes `y`, `n` or `a`:
+
+```
+Install them now? [y/N/a]
+```
+
+`a` means yes to that one and to everything after it, so you can decide once at whatever point you
+have seen enough. `--yes` is the same answer given up front, and is what unattended runs need, since
+there is no terminal to ask on.
+
+One thing `--yes` deliberately does not cover: a source checkout with uncommitted changes still
+stops the run. That is your work rather than a step in this install, so it takes its own
+`--force-checkout` to discard.
+
 ## Options
 
 | Option | Variable | Meaning |
 | --- | --- | --- |
 | `--component <name>` | `EPIC_COMPONENT` | `node`, `wallet`, `miner`, `node_wallet`, `all`. Default `node_wallet` |
-| `--yes` | `EPIC_YES` | No prompts. Required when piping with no terminal |
+| `--yes` | `EPIC_YES` | Answer yes to every question up front. Required when piping with no terminal |
 | `--install-deps` | `EPIC_INSTALL_DEPS` | Install missing build packages. Uses sudo on Linux, winget on Windows |
 | `--check` | `EPIC_CHECK_ONLY` | Preflight only, change nothing |
 | `--fast-sync` | `EPIC_FAST_SYNC` | Download a chain snapshot instead of syncing from genesis. Node only |

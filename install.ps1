@@ -32,7 +32,7 @@
     node, wallet, miner, node_wallet or all. Default: node_wallet
 
 .PARAMETER Yes
-    Do not prompt.
+    Answer yes to every question, up front. The same as answering `a` at the first one.
 
 .PARAMETER InstallDeps
     Approve installing missing build tools without being asked. Only needed for unattended runs:
@@ -920,8 +920,17 @@ cannot prompt, and this needs an answer: $Question
 "@
     }
 
-    $answer = Read-Host "$Question [y/N]"
-    return ($answer -in @('y', 'Y', 'yes', 'YES', 'Yes'))
+    $answer = Read-Host "$Question [y/N/a]"
+    if ($answer -in @('y', 'Y', 'yes', 'YES', 'Yes')) { return $true }
+    if ($answer -in @('a', 'A', 'all', 'ALL', 'All')) {
+        # Yes to this and to everything after it. The point of asking each time is that a reader
+        # may want to stop at one of them, but once they have decided they should not have to keep
+        # deciding. -Yes is the same answer given up front.
+        $script:Yes = $true
+        Write-Detail 'answering yes to the remaining questions too'
+        return $true
+    }
+    return $false
 }
 
 # ---------------------------------------------------------------------------

@@ -293,7 +293,8 @@ USAGE
 OPTIONS
     -c, --component <name>   node | wallet | miner | node_wallet | all
                              Default: node_wallet
-    -y, --yes                Do not prompt. Required when piping without a terminal.
+    -y, --yes                Answer yes to every question, up front. The same as answering `a`
+                             at the first one. Required when piping with no terminal attached.
         --install-deps       Approve installing missing build tools without being asked. Only
                              needed for unattended runs: an interactive run prints the exact
                              command and offers to run it. Uses sudo on Linux.
@@ -730,7 +731,7 @@ confirm() {
     Rerun with --yes, or set EPIC_YES=1, to accept without prompting."
 	fi
 
-	printf '%s [y/N] ' "$_question"
+	printf '%s %s[y/N/a]%s ' "$_question" "$C_DIM" "$C_RESET"
 	if [ -t 0 ]; then
 		read -r _answer || _answer=""
 	else
@@ -739,6 +740,14 @@ confirm() {
 
 	case "$_answer" in
 	y | Y | yes | YES | Yes) return 0 ;;
+	a | A | all | ALL | All)
+		# Yes to this and to everything after it. The point of asking each time is that a
+		# reader may want to stop at one of them, but once they have decided they should not
+		# have to keep deciding. --yes is the same answer given up front.
+		ASSUME_YES=1
+		detail "answering yes to the remaining questions too"
+		return 0
+		;;
 	*) return 1 ;;
 	esac
 }
