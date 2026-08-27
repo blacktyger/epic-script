@@ -6,15 +6,25 @@
     Builds the node, the wallet or the miner from pinned upstream sources and puts the binaries
     on your PATH. There are no prebuilt binaries involved, so what you run is what you compiled.
 
-        powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/blacktyger/epic-install/main/install.ps1 | iex"
+        irm https://raw.githubusercontent.com/blacktyger/epic-script/main/install.ps1 | iex
 
     Read it before you run it:
 
-        powershell -c "irm https://raw.githubusercontent.com/blacktyger/epic-install/main/install.ps1 | more"
+        irm https://raw.githubusercontent.com/blacktyger/epic-script/main/install.ps1 | more
+
+    Run it from a PowerShell prompt, which is what Windows Terminal opens. There is no
+    `powershell -ExecutionPolicy Bypass -c "..."` wrapper here on purpose: from a PowerShell
+    prompt the outer shell expands $env:NAME inside the double quotes before the child starts,
+    so the child gets a bare `=value` token and the launch fails with "The Process object must
+    have the UseShellExecute property set to false in order to use environment variables".
+    Execution policy governs script files on disk, not a string handed to iex, so the bypass
+    flag was never doing anything either. From cmd.exe, use:
+
+        powershell -c "irm <url>/install.ps1 | iex"
 
     Piped through iex, PowerShell cannot bind parameters, so use environment variables:
 
-        powershell -ExecutionPolicy Bypass -c "$env:EPIC_COMPONENT='node'; $env:EPIC_YES='1'; irm https://raw.githubusercontent.com/blacktyger/epic-install/main/install.ps1 | iex"
+        $env:EPIC_COMPONENT='node'; $env:EPIC_YES='1'; irm https://raw.githubusercontent.com/blacktyger/epic-script/main/install.ps1 | iex
 
     Run as a saved file and the parameters below work normally.
 
@@ -61,7 +71,7 @@
     Where the snapshot comes from. Default: https://bootstrap.epiccash.com/bootstrap.zip
 
 .NOTES
-    Licence: MIT. Source: https://github.com/blacktyger/epic-install
+    Licence: MIT. Source: https://github.com/blacktyger/epic-script
 
     Environment variable equivalents, which are the easier route through a pipe:
     EPIC_COMPONENT, EPIC_YES, EPIC_INSTALL_DEPS, EPIC_CHECK_ONLY, EPIC_WITH_TOR,
@@ -77,17 +87,12 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('node', 'wallet', 'miner', 'node_wallet', 'all')]
     [string]$Component,
-
     [switch]$Yes,
     [switch]$InstallDeps,
     [switch]$Check,
     [switch]$WithTor,
-
-    [ValidateSet('cpu', 'opencl', 'cuda')]
     [string]$MinerFeatures,
-
     [string]$BinDir,
     [string]$SrcDir,
     [int]$Jobs,
@@ -96,6 +101,35 @@ param(
     [switch]$FastSync,
     [string]$BootstrapUrl
 )
+
+# No [ValidateSet] on Component or MinerFeatures, deliberately, and the reason is the whole reason
+# this script exists in one piece. A validation attribute cannot be applied when the script is run
+# through Invoke-Expression, which is exactly what `irm ... | iex` does: PowerShell reports
+#
+#   Cannot process argument because the value of argument "validValues" is out of range
+#
+# and nothing runs. Values are checked in Resolve-Settings instead, which also produces a better
+# message than the attribute does. Verified against PowerShell 7.4: a plain [string] parameter and
+# a [switch] both survive iex, a [ValidateSet] one does not.
+
+# Copied into script scope here, at the top level, because this is the only point all three
+# invocation modes agree on. Run as a file, parameters land in script scope. Run through iex, they
+# land in the caller's. Run through [scriptblock]::Create, they land in the block's own scope and
+# the functions below cannot see them at all, which failed with
+# "The variable '$script:Component' cannot be retrieved because it has not been set".
+$script:OptComponent = $Component
+$script:OptMinerFeatures = $MinerFeatures
+$script:OptBinDir = $BinDir
+$script:OptSrcDir = $SrcDir
+$script:OptBootstrapUrl = $BootstrapUrl
+$script:OptJobs = $Jobs
+$script:OptYes = [bool]$Yes
+$script:OptInstallDeps = [bool]$InstallDeps
+$script:OptCheck = [bool]$Check
+$script:OptWithTor = [bool]$WithTor
+$script:OptNoModifyPath = [bool]$NoModifyPath
+$script:OptNoPatchCmake = [bool]$NoPatchCmake
+$script:OptFastSync = [bool]$FastSync
 
 $InstallerVersion = '1.0.0'
 
@@ -174,33 +208,29 @@ function Stop-WithError([string]$Message) {
 # ---------------------------------------------------------------------------
 
 function Resolve-Settings {
-    if (-not $script:Component) {
-        $script:Component = if ($env:EPIC_COMPONENT) { $env:EPIC_COMPONENT } else { 'node_wallet' }
-    }
-    if (-not $script:MinerFeatures) {
-        $script:MinerFeatures = if ($env:EPIC_MINER_FEATURES) { $env:EPIC_MINER_FEATURES } else { 'cpu' }
-    }
-    if (-not $script:BinDir) {
-        $script:BinDir = if ($env:EPIC_BIN_DIR) { $env:EPIC_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'Epic\bin' }
-    }
-    if (-not $script:SrcDir) {
-        $script:SrcDir = if ($env:EPIC_SRC_DIR) { $env:EPIC_SRC_DIR } else { Join-Path $env:LOCALAPPDATA 'Epic\src' }
-    }
-    if (-not $script:Jobs) {
-        $script:Jobs = if ($env:EPIC_JOBS) { [int]$env:EPIC_JOBS } else { 0 }
-    }
-    if (-not $script:BootstrapUrl) {
-        $script:BootstrapUrl = if ($env:EPIC_BOOTSTRAP_URL) { $env:EPIC_BOOTSTRAP_URL } else { $BootstrapUrlDefault }
-    }
+    # An explicit parameter always wins over an environment variable, which wins over the default.
+    $script:Component = if ($script:OptComponent) { $script:OptComponent }
+        elseif ($env:EPIC_COMPONENT) { $env:EPIC_COMPONENT } else { 'node_wallet' }
+    $script:MinerFeatures = if ($script:OptMinerFeatures) { $script:OptMinerFeatures }
+        elseif ($env:EPIC_MINER_FEATURES) { $env:EPIC_MINER_FEATURES } else { 'cpu' }
+    $script:BinDir = if ($script:OptBinDir) { $script:OptBinDir }
+        elseif ($env:EPIC_BIN_DIR) { $env:EPIC_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'Epic\bin' }
+    $script:SrcDir = if ($script:OptSrcDir) { $script:OptSrcDir }
+        elseif ($env:EPIC_SRC_DIR) { $env:EPIC_SRC_DIR } else { Join-Path $env:LOCALAPPDATA 'Epic\src' }
+    $script:BootstrapUrl = if ($script:OptBootstrapUrl) { $script:OptBootstrapUrl }
+        elseif ($env:EPIC_BOOTSTRAP_URL) { $env:EPIC_BOOTSTRAP_URL } else { $BootstrapUrlDefault }
+    $script:Jobs = if ($script:OptJobs) { $script:OptJobs }
+        elseif ($env:EPIC_JOBS) { [int]$env:EPIC_JOBS } else { 0 }
 
-    if ($env:EPIC_YES -eq '1') { $script:Yes = $true }
-    if ($env:EPIC_INSTALL_DEPS -eq '1') { $script:InstallDeps = $true }
-    if ($env:EPIC_CHECK_ONLY -eq '1') { $script:Check = $true }
-    if ($env:EPIC_WITH_TOR -eq '1') { $script:WithTor = $true }
-    if ($env:EPIC_NO_MODIFY_PATH -eq '1') { $script:NoModifyPath = $true }
-    if ($env:EPIC_NO_PATCH_CMAKE -eq '1') { $script:NoPatchCmake = $true }
-    if ($env:EPIC_FAST_SYNC -eq '1') { $script:FastSync = $true }
+    $script:Yes = $script:OptYes -or ($env:EPIC_YES -eq '1')
+    $script:InstallDeps = $script:OptInstallDeps -or ($env:EPIC_INSTALL_DEPS -eq '1')
+    $script:Check = $script:OptCheck -or ($env:EPIC_CHECK_ONLY -eq '1')
+    $script:WithTor = $script:OptWithTor -or ($env:EPIC_WITH_TOR -eq '1')
+    $script:NoModifyPath = $script:OptNoModifyPath -or ($env:EPIC_NO_MODIFY_PATH -eq '1')
+    $script:NoPatchCmake = $script:OptNoPatchCmake -or ($env:EPIC_NO_PATCH_CMAKE -eq '1')
+    $script:FastSync = $script:OptFastSync -or ($env:EPIC_FAST_SYNC -eq '1')
 
+    # Checked here rather than with a [ValidateSet] attribute, which cannot be applied under iex.
     $valid = @('node', 'wallet', 'miner', 'node_wallet', 'all')
     if ($script:Component -notin $valid) {
         Stop-WithError "unknown component '$($script:Component)'. Choose $($valid -join ', ')."

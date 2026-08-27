@@ -11,14 +11,16 @@ puts the binaries on your PATH. What you run is what you compiled.
 Linux and macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-install/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/install.sh | sh
 ```
 
 Windows, PowerShell 5.1 or later:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/blacktyger/epic-install/main/install.ps1 | iex"
+irm https://raw.githubusercontent.com/blacktyger/epic-script/main/install.ps1 | iex
 ```
+
+From `cmd.exe` instead: `powershell -c "irm https://raw.githubusercontent.com/blacktyger/epic-script/main/install.ps1 | iex"`
 
 The default is the node and the wallet. Expect 10 to 30 minutes per component and a few GB of disk,
 because this is a real compile.
@@ -28,17 +30,17 @@ because this is a real compile.
 You are about to run a script from the internet. Read it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-install/main/install.sh | less
+curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/install.sh | less
 ```
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/blacktyger/epic-install/main/install.ps1 | more"
+irm https://raw.githubusercontent.com/blacktyger/epic-script/main/install.ps1 | more
 ```
 
 Or see what it would do without changing anything:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-install/main/install.sh | sh -s -- --check
+curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/install.sh | sh -s -- --check
 ```
 
 `--check` runs every preflight test, prints the plan, and stops.
@@ -59,7 +61,19 @@ curl -fsSL .../install.sh | sh -s -- --component node --fast-sync
 Through a pipe, PowerShell cannot bind parameters, so use environment variables:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "$env:EPIC_COMPONENT='node'; $env:EPIC_FAST_SYNC='1'; irm .../install.ps1 | iex"
+$env:EPIC_COMPONENT='node'; $env:EPIC_FAST_SYNC='1'; irm https://raw.githubusercontent.com/blacktyger/epic-script/main/install.ps1 | iex
+```
+
+Do not wrap that in `powershell -c "..."` from a PowerShell prompt. The outer shell expands
+`$env:EPIC_COMPONENT` inside the double quotes before the child process starts, so the child gets a
+bare `=node` token and the launch fails with `The Process object must have the UseShellExecute
+property set to false in order to use environment variables`. Execution policy governs script files
+on disk, not a string handed to `iex`, so no bypass flag is needed here either.
+
+Running it as a saved file takes ordinary parameters instead:
+
+```powershell
+./install.ps1 -Component node -FastSync
 ```
 
 Every option has a variable equivalent, which also works on Unix and is the easier route in CI:

@@ -4,11 +4,11 @@
 # Builds the node, the wallet or the miner from pinned upstream sources and puts the binaries
 # on your PATH. There are no prebuilt binaries involved, so what you run is what you compiled.
 #
-#   curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-install/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/install.sh | sh
 #
 # Read it before you run it:
 #
-#   curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-install/main/install.sh | less
+#   curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/install.sh | less
 #
 # Pass options through the pipe with `sh -s --`:
 #
@@ -26,7 +26,7 @@
 #     seed. Creating a wallet stays your explicit step.
 #   - It writes an uninstaller that removes exactly what it added.
 #
-# Licence: MIT. Source: https://github.com/blacktyger/epic-install
+# Licence: MIT. Source: https://github.com/blacktyger/epic-script
 
 set -u
 
@@ -58,7 +58,7 @@ WALLET_BIN="epic-wallet"
 # rustc. The crate is abandoned, but 0.3.25 exists specifically to fix that, and it arrives
 # through rust-crypto under cuckoo_miner, which epic_miner_config depends on unconditionally,
 # so no feature flag avoids it. The fork carries that fix plus three Windows build fixes.
-# Reasoning and per-blocker detail: https://github.com/blacktyger/epic-install#the-miner
+# Reasoning and per-blocker detail: https://github.com/blacktyger/epic-script#the-miner
 MINER_REPO="https://github.com/blacktyger/epic-miner.git"
 MINER_REF="e9d0d85dbb2db39aca66a3d1b5baf95788523694"
 MINER_UPSTREAM="https://github.com/EpicCash/epic-miner.git"
@@ -215,7 +215,7 @@ detect_platform() {
 		;;
 	MINGW* | MSYS* | CYGWIN* | Windows_NT)
 		err "this is the Unix installer. On Windows run the PowerShell one:
-    powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/blacktyger/epic-install/main/install.ps1 | iex\""
+    powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/blacktyger/epic-script/main/install.ps1 | iex\""
 		;;
 	*)
 		err "unsupported operating system '$_ostype'. This installer covers Linux and macOS."
