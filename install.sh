@@ -84,24 +84,177 @@ BOOTSTRAP_URL_DEFAULT="https://bootstrap.epiccash.com/bootstrap.zip"
 CHAIN_MARKERS="lmdb txhashset header chain peer"
 
 # ---------------------------------------------------------------------------
-# Output helpers
+# Output
+#
+# Colour, a spinner and step numbering when there is a terminal that wants them, and plain
+# unstyled lines when there is not. The distinction matters: this script is read by people at a
+# prompt and by CI logs, and escape codes in a log file are noise nobody asked for.
+#
+# NO_COLOR is honoured because it is the convention, and TERM=dumb because some CI runners hand
+# out a tty that cannot do any of this.
 # ---------------------------------------------------------------------------
 
-say() {
-	printf 'epic-script: %s\n' "$1"
+setup_style() {
+	C_RESET=''
+	C_DIM=''
+	C_BOLD=''
+	C_OK=''
+	C_WARN=''
+	C_ERR=''
+	C_ACCENT=''
+	SPIN_BSLASH=''
+	FANCY=0
+
+	[ -n "${NO_COLOR:-}" ] && return 0
+	[ -t 1 ] || return 0
+	case "${TERM:-}" in
+	dumb | '') return 0 ;;
+	esac
+
+	C_RESET="$(printf '\033[0m')"
+	C_DIM="$(printf '\033[2m')"
+	C_BOLD="$(printf '\033[1m')"
+	C_OK="$(printf '\033[32m')"
+	C_WARN="$(printf '\033[33m')"
+	C_ERR="$(printf '\033[31m')"
+	C_ACCENT="$(printf '\033[36m')"
+	# Built from its octal code so the literal never appears in quotes, where a lone backslash
+	# reads as a mistake even though POSIX treats it as itself.
+	SPIN_BSLASH="$(printf '\134')"
+	FANCY=1
 }
 
 say_bare() {
 	printf '%s\n' "$1"
 }
 
+# A step heading. Numbered so a reader knows how much is left, which matters when one of them
+# takes twenty minutes.
+step() {
+	STEP_N=$((STEP_N + 1))
+	printf '\n%s[%s/%s]%s %s%s%s\n' \
+		"$C_DIM" "$STEP_N" "$STEP_TOTAL" "$C_RESET" "$C_BOLD" "$1" "$C_RESET"
+}
+
+# Indented supporting line under a step.
+detail() {
+	printf '        %s%s%s\n' "$C_DIM" "$1" "$C_RESET"
+}
+
+# A result under a step. Kept to one line each so a finished run reads as a list of outcomes.
+ok() {
+	printf '        %s%s%s %s\n' "$C_OK" "$(mark ok)" "$C_RESET" "$1"
+}
+
+info() {
+	printf '        %s\n' "$1"
+}
+
+mark() {
+	if [ "$FANCY" = "1" ]; then
+		case "$1" in
+		ok) printf '✓' ;;
+		warn) printf '!' ;;
+		err) printf '✗' ;;
+		esac
+	else
+		case "$1" in
+		ok) printf 'ok' ;;
+		warn) printf 'warning' ;;
+		err) printf 'error' ;;
+		esac
+	fi
+}
+
+# Retained because the whole script calls it. Now an indented plain line rather than a prefixed
+# one: the prefix repeated on every line was most of the visual noise.
+say() {
+	printf '        %s\n' "$1"
+}
+
 warn() {
-	printf 'epic-script: warning: %s\n' "$1" >&2
+	printf '        %s%s%s %s\n' "$C_WARN" "$(mark warn)" "$C_RESET" "$1" >&2
 }
 
 err() {
-	printf 'epic-script: error: %s\n' "$1" >&2
+	printf '\n%s%s%s %s\n' "$C_ERR" "$(mark err)" "$C_RESET" "$1" >&2
 	exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Running noisy commands
+#
+# A cargo build prints hundreds of lines nobody reads while it succeeds, and the twenty lines
+# that matter when it fails. So output goes to a log, a spinner shows the wait is alive, and the
+# tail of the log is printed only if the command fails.
+#
+# Without a terminal there is nothing to animate and nothing to overwrite, so the command runs
+# with its output still captured but a plain line printed first. A silent wait with no way to
+# see progress is the one outcome worth avoiding.
+# ---------------------------------------------------------------------------
+
+# run_logged <label> <logfile> <command...>
+run_logged() {
+	_label="$1"
+	_log="$2"
+	shift 2
+
+	ensure mkdir -p "$(dirname "$_log")"
+
+	if [ "$FANCY" != "1" ]; then
+		detail "$_label, logging to $_log"
+		"$@" >>"$_log" 2>&1
+		return $?
+	fi
+
+	"$@" >>"$_log" 2>&1 &
+	_pid=$!
+	_start=$(date +%s 2>/dev/null || echo 0)
+	_i=0
+
+	while kill -0 "$_pid" 2>/dev/null; do
+		_i=$((_i + 1))
+		case $((_i % 4)) in
+		0) _f='|' ;;
+		1) _f='/' ;;
+		2) _f='-' ;;
+		3) _f="$SPIN_BSLASH" ;;
+		esac
+		_now=$(date +%s 2>/dev/null || echo 0)
+		_secs=$((_now - _start))
+		printf '\r        %s%s%s %s  %s%dm%02ds%s' \
+			"$C_ACCENT" "$_f" "$C_RESET" "$_label" \
+			"$C_DIM" "$((_secs / 60))" "$((_secs % 60))" "$C_RESET"
+		sleep 1
+	done
+
+	# `wait` on an already-reaped pid still yields its status in every shell this targets.
+	wait "$_pid"
+	_status=$?
+
+	_now=$(date +%s 2>/dev/null || echo 0)
+	_secs=$((_now - _start))
+	# Blank the spinner line before writing the result over it.
+	printf '\r                                                                              \r'
+
+	if [ "$_status" -eq 0 ]; then
+		printf '        %s%s%s %s  %s%dm%02ds%s\n' \
+			"$C_OK" "$(mark ok)" "$C_RESET" "$_label" \
+			"$C_DIM" "$((_secs / 60))" "$((_secs % 60))" "$C_RESET"
+	fi
+	return "$_status"
+}
+
+# The part of a failed log worth reading, which is the end of it.
+show_log_tail() {
+	_log="$1"
+	_lines="${2:-25}"
+	[ -f "$_log" ] || return 0
+	say_bare ""
+	printf '%slast %s lines of %s%s\n' "$C_DIM" "$_lines" "$_log" "$C_RESET"
+	say_bare ""
+	tail -n "$_lines" "$_log"
+	say_bare ""
 }
 
 # Run a command and abort with the command line if it fails. Used instead of `set -e`, whose
@@ -637,63 +790,89 @@ fetch_source() {
 				ensure git -C "$_dir" remote add origin "$_repo"
 			fi
 		fi
-		say "updating $2 to $_ref"
-		ensure git -C "$_dir" fetch --tags --force origin
-		ensure git -C "$_dir" checkout --force "$_ref"
+		_log="$LOG_DIR/fetch-$2.log"
+		ensure mkdir -p "$LOG_DIR"
+		: >"$_log"
+		if ! run_logged "updating $2 to $_ref" "$_log" \
+			sh -c "git -C \"$_dir\" fetch --tags --force origin && git -C \"$_dir\" checkout --force \"$_ref\""; then
+			show_log_tail "$_log"
+			err "could not update $_dir to $_ref. Full log: $_log"
+		fi
 	else
-		say "cloning $2 at $_ref (this is the slow part on a cold cache)"
-		ensure git clone --quiet "$_repo" "$_dir"
-		ensure git -C "$_dir" checkout --force "$_ref"
+		_log="$LOG_DIR/fetch-$2.log"
+		ensure mkdir -p "$LOG_DIR"
+		: >"$_log"
+		if ! run_logged "cloning $2 at $_ref" "$_log" \
+			sh -c "git clone --quiet \"$_repo\" \"$_dir\" && git -C \"$_dir\" checkout --force \"$_ref\""; then
+			show_log_tail "$_log"
+			err "could not clone $_repo. Full log: $_log"
+		fi
 	fi
 
 	if [ "$_recursive" = "yes" ]; then
 		# The miner's .gitmodules uses relative URLs, so these resolve against whichever
 		# account owns the parent. Cloning from EpicCash therefore picks up
 		# EpicCash/randomx-rust and EpicCash/progpow-rust, which is what we want.
-		say "fetching $2 submodules"
-		ensure git -C "$_dir" submodule update --init --recursive
+		_log="$LOG_DIR/submodules-$2.log"
+		: >"$_log"
+		if ! run_logged "fetching $2 submodules" "$_log" \
+			git -C "$_dir" submodule update --init --recursive; then
+			show_log_tail "$_log"
+			err "could not check out the submodules of $_dir. Full log: $_log"
+		fi
 	fi
 
 	# Report exactly what is about to be compiled. This is the one line a careful user checks.
-	say "$2 is at $(git -C "$_dir" rev-parse --short HEAD)"
+	detail "$2 is at $(git -C "$_dir" rev-parse --short HEAD)"
 }
 
 # Build one crate. cargo output is not captured, so progress is visible: a silent 20 minute
 # wait is indistinguishable from a hang.
+# run_cargo_build <dir> <name> [extra cargo args...]
+#
+# Output goes to a log rather than the screen. A successful cargo build prints hundreds of lines
+# nobody reads; a failed one prints the twenty that matter, at the end. So the log is always
+# written and only shown when it is worth reading.
 run_cargo_build() {
 	_dir="$1"
-	shift
+	_name="$2"
+	shift 2
 
-	say "building in $_dir"
-	say_bare ""
-	# shellcheck disable=SC2086
-	# JOBS_ARG is intentionally word-split: it is either empty or `-j N`.
-	if ! (cd "$_dir" && cargo build --release $JOBS_ARG "$@"); then
-		say_bare ""
-		err "the build failed in $_dir.
-    The cargo error above is the real cause. Common ones:
-      - a missing development library, so rerun with --check to list them
-      - too little disk or memory, since these are large Rust workspaces
-    Sources are kept at $_dir, so you can retry there without recloning."
+	_log="$LOG_DIR/build-$_name.log"
+	ensure mkdir -p "$LOG_DIR"
+	: >"$_log"
+
+	# One sh -c so the cd and the cargo call are a single child this can background and time.
+	# JOBS_ARG and the extra arguments are intentionally unquoted inside it: both are either
+	# empty or already-safe flag words.
+	if ! run_logged "compiling $_name" "$_log" \
+		sh -c "cd \"$_dir\" && exec cargo build --release $JOBS_ARG $*"; then
+		show_log_tail "$_log"
+		err "the build of $_name failed.
+        The cargo error above is the real cause. The usual ones are a missing development
+        library, which --check lists, or too little disk or memory for what are large Rust
+        workspaces.
+
+        Full log:  $_log
+        Sources:   $_dir  (kept, so a retry does not reclone)"
 	fi
-	say_bare ""
 }
 
 build_node() {
 	fetch_source "$NODE_REPO" "$NODE_DIR" "$NODE_REF" "no"
 	if [ "$WITH_TOR" = "1" ]; then
-		run_cargo_build "$SRC_DIR/$NODE_DIR" --features with-tor
+		run_cargo_build "$SRC_DIR/$NODE_DIR" node --features with-tor
 	else
-		run_cargo_build "$SRC_DIR/$NODE_DIR"
+		run_cargo_build "$SRC_DIR/$NODE_DIR" node
 	fi
 }
 
 build_wallet() {
 	fetch_source "$WALLET_REPO" "$WALLET_DIR" "$WALLET_REF" "no"
 	if [ "$WITH_TOR" = "1" ]; then
-		run_cargo_build "$SRC_DIR/$WALLET_DIR" --features with-tor
+		run_cargo_build "$SRC_DIR/$WALLET_DIR" wallet --features with-tor
 	else
-		run_cargo_build "$SRC_DIR/$WALLET_DIR"
+		run_cargo_build "$SRC_DIR/$WALLET_DIR" wallet
 	fi
 }
 
@@ -707,15 +886,15 @@ build_miner() {
 
 	case "$MINER_FEATURES" in
 	cpu)
-		run_cargo_build "$SRC_DIR/$MINER_DIR"
+		run_cargo_build "$SRC_DIR/$MINER_DIR" miner
 		;;
 	opencl)
-		run_cargo_build "$SRC_DIR/$MINER_DIR" --features opencl
+		run_cargo_build "$SRC_DIR/$MINER_DIR" miner --features opencl
 		;;
 	cuda)
 		# Upstream's README documents `--features cuda,tui` here, which cannot work: there is
 		# no `tui` feature in the manifest and cargo rejects it outright.
-		run_cargo_build "$SRC_DIR/$MINER_DIR" --no-default-features --features cuda
+		run_cargo_build "$SRC_DIR/$MINER_DIR" miner --no-default-features --features cuda
 		;;
 	*)
 		err "unknown --miner-features '$MINER_FEATURES'. Use cpu, opencl or cuda."
@@ -1224,26 +1403,23 @@ UNTAIL
 verify_install() {
 	_failed=""
 
-	say_bare ""
-	say "verifying"
-
 	if want_node; then
 		if _v="$("$BIN_DIR/$NODE_BIN" --version 2>&1)"; then
-			say_bare "  node    $_v"
+			ok "$_v"
 		else
 			_failed="$_failed $NODE_BIN"
 		fi
 	fi
 	if want_wallet; then
 		if _v="$("$BIN_DIR/$WALLET_BIN" --version 2>&1)"; then
-			say_bare "  wallet  $_v"
+			ok "$_v"
 		else
 			_failed="$_failed $WALLET_BIN"
 		fi
 	fi
 	if want_miner; then
 		if _v="$("$BIN_DIR/$MINER_BIN" --version 2>&1)"; then
-			say_bare "  miner   $_v"
+			ok "$_v"
 		else
 			_failed="$_failed $MINER_BIN"
 		fi
@@ -1257,7 +1433,8 @@ verify_install() {
 
 next_steps() {
 	say_bare ""
-	say "installed to $BIN_DIR"
+	printf '  %s%s%s installed to %s\n' "$C_OK" "$(mark ok)" "$C_RESET" "$BIN_DIR"
+	say_bare ""
 
 	if [ "${PATH_NEEDS_RELOAD:-0}" = "1" ]; then
 		say_bare ""
@@ -1277,8 +1454,8 @@ next_steps() {
 
 	say_bare ""
 	if want_node; then
-		say_bare "Node:   epic server config     writes epic-server.toml in the current directory"
-		say_bare "        epic server run        starts syncing mainnet"
+		say_bare "  Node:     epic server config     writes epic-server.toml in the current directory"
+		say_bare "            epic server run        starts syncing mainnet"
 		if [ "$FAST_SYNC_STATUS" = "ok" ]; then
 			say_bare "        The snapshot is in ~/.epic/main/chain_data, which is where the node looks"
 			say_bare "        by default. Running the node from a directory that has its own"
@@ -1290,16 +1467,18 @@ next_steps() {
 		fi
 	fi
 	if want_wallet; then
-		say_bare "Wallet: epic-wallet init       creates a wallet and prints a seed phrase."
-		say_bare "                               Write the seed down offline. It is the only backup."
+		say_bare "  Wallet:   epic-wallet init       creates a wallet and prints a seed phrase."
+		say_bare "                                     Write the seed down offline, it is the only backup."
 	fi
 	if want_miner; then
-		say_bare "Miner:  epic-miner             runs against a node's Stratum server on 3416."
-		say_bare "                               Config: $MINER_HOME/epic-miner.toml"
+		say_bare "  Miner:    epic-miner             runs against a node's Stratum server on 3416."
+		say_bare "                                     Config: $MINER_HOME/epic-miner.toml"
 	fi
 	say_bare ""
-	say_bare "Docs:      https://devdocs.epiccash.com"
-	say_bare "Uninstall: sh $INSTALL_META/uninstall.sh"
+	say_bare "  Docs:      https://devdocs.epiccash.com"
+	say_bare "  Uninstall: sh $INSTALL_META/uninstall.sh"
+	say_bare "  Logs:      $LOG_DIR"
+	say_bare ""
 }
 
 # ---------------------------------------------------------------------------
@@ -1549,7 +1728,8 @@ show_plan() {
 	want_miner && _what="$_what miner($MINER_FEATURES)"
 
 	say_bare ""
-	say_bare "Epic Cash source installer $INSTALLER_VERSION"
+	printf '  %sEpic Cash%s %ssource installer %s%s\n' \
+		"$C_BOLD" "$C_RESET" "$C_DIM" "$INSTALLER_VERSION" "$C_RESET"
 	say_bare ""
 	say_bare "  platform    $PLATFORM $ARCH"
 	say_bare "  building    $(echo "$_what" | sed 's/^ //')"
@@ -1599,13 +1779,25 @@ main() {
 	PATH_NEEDS_ACTION=0
 	RUSTUP_WAS_INSTALLED=0
 
+	setup_style
 	parse_args "$@"
 	validate_component
+
+	# Counted up front so the step numbers mean something. Four fixed steps, being the toolchain
+	# check, Rust, the install and the verify, then one per component, plus the snapshot when it
+	# was asked for.
+	STEP_N=0
+	STEP_TOTAL=4
+	want_node && STEP_TOTAL=$((STEP_TOTAL + 1))
+	want_wallet && STEP_TOTAL=$((STEP_TOTAL + 1))
+	want_miner && STEP_TOTAL=$((STEP_TOTAL + 1))
+	[ "$FAST_SYNC" = "1" ] && STEP_TOTAL=$((STEP_TOTAL + 1))
 
 	[ -n "${HOME:-}" ] || err "HOME is not set, so there is nowhere to install to"
 
 	MINER_HOME="$HOME/.epic/miner"
 	INSTALL_META="$HOME/.epic/install"
+	LOG_DIR="$INSTALL_META/logs"
 	JOBS_ARG=""
 	[ -n "$JOBS" ] && JOBS_ARG="-j $JOBS"
 
@@ -1620,47 +1812,64 @@ main() {
 	show_plan
 
 	# Preflight before any prompt, so a doomed run fails in seconds rather than after consent.
+	step "Checking the toolchain"
 	report_and_install_deps
 	want_miner && check_cmake_empty_target
 	check_disk
 
 	if [ "$CHECK_ONLY" = "1" ]; then
 		say_bare ""
-		say "check complete. Nothing was changed. Drop --check to install."
+		ok "check complete, nothing was changed. Drop --check to install."
+		say_bare ""
 		rm -rf "$WORK_TMP" 2>/dev/null || true
 		return 0
 	fi
 
+	say_bare ""
 	if ! confirm "Build and install the above?"; then
 		say "cancelled, nothing was changed"
 		rm -rf "$WORK_TMP" 2>/dev/null || true
 		return 0
 	fi
 
+	step "Rust toolchain"
 	ensure_rust
 
-	ensure mkdir -p "$SRC_DIR" "$BIN_DIR" "$INSTALL_META"
+	ensure mkdir -p "$SRC_DIR" "$BIN_DIR" "$INSTALL_META" "$LOG_DIR"
 
 	RECEIPT="$INSTALL_META/receipt.txt"
 	# Not truncated: the receipt accumulates across runs so the uninstaller knows about
 	# components installed earlier.
 	[ -f "$RECEIPT" ] || : >"$RECEIPT"
 
-	want_node && build_node
-	want_wallet && build_wallet
-	want_miner && build_miner
+	if want_node; then
+		step "Node"
+		build_node
+	fi
+	if want_wallet; then
+		step "Wallet"
+		build_wallet
+	fi
+	if want_miner; then
+		step "Miner"
+		build_miner
+	fi
 
+	step "Installing"
 	want_node && install_binary "$SRC_DIR/$NODE_DIR/target/release/$NODE_BIN" "$NODE_BIN"
 	want_wallet && install_binary "$SRC_DIR/$WALLET_DIR/target/release/$WALLET_BIN" "$WALLET_BIN"
 	want_miner && install_miner
 
 	setup_path
 	write_uninstaller
+
+	step "Verifying"
 	verify_install
 
 	# After verification, so a failed build or a broken binary is reported before committing to
 	# a multi-gigabyte download.
 	if [ "$FAST_SYNC" = "1" ]; then
+		step "Chain snapshot"
 		fast_sync
 	fi
 

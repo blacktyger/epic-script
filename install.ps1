@@ -183,21 +183,147 @@ $ChainMarkers = @('lmdb', 'txhashset', 'header', 'chain', 'peer')
 # Output helpers
 # ---------------------------------------------------------------------------
 
-function Write-Info([string]$Message) {
-    Write-Host "epic-script: $Message"
+# Colour and a spinner when the host can show them, plain text when it cannot. NO_COLOR is
+# honoured because it is the convention, and a redirected stream gets no escape codes because
+# nobody wants them in a log file.
+function Initialize-Style {
+    $script:Fancy = $true
+    if ($env:NO_COLOR) { $script:Fancy = $false }
+    try {
+        if ([Console]::IsOutputRedirected) { $script:Fancy = $false }
+    } catch {
+        $script:Fancy = $false
+    }
+    $script:StepN = 0
+    $script:StepTotal = 0
+}
+
+function Get-Mark([string]$Kind) {
+    if ($script:Fancy) {
+        switch ($Kind) { 'ok' { return [char]0x2713 } 'warn' { return '!' } 'err' { return [char]0x2717 } }
+    }
+    switch ($Kind) { 'ok' { return 'ok' } 'warn' { return 'warning' } 'err' { return 'error' } }
 }
 
 function Write-Plain([string]$Message) {
     Write-Host $Message
 }
 
+# A step heading. Numbered so a reader knows how much is left, which matters when one of them
+# takes twenty minutes.
+function Write-Step([string]$Title) {
+    $script:StepN++
+    Write-Host ''
+    Write-Host "[$($script:StepN)/$($script:StepTotal)] " -NoNewline -ForegroundColor DarkGray
+    Write-Host $Title -ForegroundColor White
+}
+
+# Retained under its old name because the whole script calls it. Now an indented plain line: the
+# repeated prefix was most of the visual noise.
+function Write-Info([string]$Message) {
+    Write-Host "        $Message"
+}
+
+function Write-Detail([string]$Message) {
+    Write-Host "        $Message" -ForegroundColor DarkGray
+}
+
+function Write-Ok([string]$Message) {
+    Write-Host "        $(Get-Mark 'ok') " -NoNewline -ForegroundColor Green
+    Write-Host $Message
+}
+
 function Write-Warn([string]$Message) {
-    Write-Host "epic-script: warning: $Message" -ForegroundColor Yellow
+    Write-Host "        $(Get-Mark 'warn') " -NoNewline -ForegroundColor Yellow
+    Write-Host $Message
 }
 
 function Stop-WithError([string]$Message) {
-    Write-Host "epic-script: error: $Message" -ForegroundColor Red
+    Write-Host ''
+    $lead = if ($script:Fancy) { "$(Get-Mark 'err') " } else { 'error: ' }
+    Write-Host $lead -NoNewline -ForegroundColor Red
+    Write-Host $Message -ForegroundColor Red
     exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Running noisy commands
+#
+# A cargo build prints hundreds of lines nobody reads while it succeeds, and the twenty that
+# matter when it fails. So output goes to a log, a spinner shows the wait is alive, and the tail
+# of the log is printed only if the command fails.
+#
+# Start-Process rather than the call operator, because polling HasExited is what makes a spinner
+# possible at all, and because it gives a real exit code for a native command.
+# ---------------------------------------------------------------------------
+
+function Invoke-Logged {
+    param(
+        [string]$Label,
+        [string]$LogPath,
+        [string]$Exe,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory
+    )
+
+    New-Item -ItemType Directory -Path (Split-Path $LogPath -Parent) -Force | Out-Null
+    # Start-Process refuses to send both streams to one file, so stderr lands beside the log and
+    # is folded in afterwards. One file holds the whole story by the time anyone reads it.
+    $errPath = "$LogPath.err"
+
+    $startArgs = @{
+        FilePath               = $Exe
+        NoNewWindow            = $true
+        PassThru               = $true
+        RedirectStandardOutput = $LogPath
+        RedirectStandardError  = $errPath
+    }
+    if ($Arguments -and $Arguments.Count -gt 0) { $startArgs.ArgumentList = $Arguments }
+    if ($WorkingDirectory) { $startArgs.WorkingDirectory = $WorkingDirectory }
+
+    $proc = Start-Process @startArgs
+    $started = Get-Date
+
+    if ($script:Fancy) {
+        $frames = @('|', '/', '-', '\')
+        $i = 0
+        while (-not $proc.HasExited) {
+            $spent = (Get-Date) - $started
+            $stamp = '{0}m{1:d2}s' -f [int]$spent.TotalMinutes, $spent.Seconds
+            Write-Host "`r        $($frames[$i % 4]) $Label  $stamp " -NoNewline -ForegroundColor Cyan
+            $i++
+            Start-Sleep -Milliseconds 400
+        }
+        Write-Host "`r$(' ' * 78)`r" -NoNewline
+    } else {
+        Write-Detail "$Label, logging to $LogPath"
+    }
+
+    $proc.WaitForExit()
+
+    if (Test-Path $errPath) {
+        Get-Content -LiteralPath $errPath -ErrorAction SilentlyContinue | Add-Content -LiteralPath $LogPath
+        Remove-Item -LiteralPath $errPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $spent = (Get-Date) - $started
+    if ($proc.ExitCode -eq 0 -and $script:Fancy) {
+        $stamp = '{0}m{1:d2}s' -f [int]$spent.TotalMinutes, $spent.Seconds
+        Write-Host "        $(Get-Mark 'ok') " -NoNewline -ForegroundColor Green
+        Write-Host "$Label  " -NoNewline
+        Write-Host $stamp -ForegroundColor DarkGray
+    }
+    return $proc.ExitCode
+}
+
+# The part of a failed log worth reading, which is the end of it.
+function Show-LogTail([string]$LogPath, [int]$Lines = 25) {
+    if (-not (Test-Path $LogPath)) { return }
+    Write-Plain ''
+    Write-Host "last $Lines lines of $LogPath" -ForegroundColor DarkGray
+    Write-Plain ''
+    Get-Content -LiteralPath $LogPath -Tail $Lines -ErrorAction SilentlyContinue | ForEach-Object { Write-Plain $_ }
+    Write-Plain ''
 }
 
 # ---------------------------------------------------------------------------
@@ -249,6 +375,7 @@ function Resolve-Settings {
 
     $script:MinerHome = Join-Path $env:LOCALAPPDATA 'Epic\miner'
     $script:MetaDir = Join-Path $env:LOCALAPPDATA 'Epic\install'
+    $script:LogDir = Join-Path $script:MetaDir 'logs'
     # The node resolves its home from the user profile, not LOCALAPPDATA.
     $script:EpicMainHome = Join-Path $env:USERPROFILE '.epic\main'
 }
@@ -431,7 +558,7 @@ function Find-StrawberryPerl {
 # Installer and no workload at all, which produces no compiler while looking like it succeeded.
 function Get-WingetCommand($Entry) {
     $cmd = "winget install --accept-package-agreements --accept-source-agreements --id $($Entry.Winget)"
-    if ($Entry.Override) { $cmd += " --override `"$($Entry.Override)`"" }
+    if ($Entry.ContainsKey('Override')) { $cmd += " --override `"$($Entry['Override'])`"" }
     return $cmd
 }
 
@@ -444,7 +571,7 @@ function Invoke-WingetInstall($Entry) {
         '--accept-source-agreements'
         '--id', $Entry.Winget
     )
-    if ($Entry.Override) { $wingetArgs += @('--override', $Entry.Override) }
+    if ($Entry.ContainsKey('Override')) { $wingetArgs += @('--override', $Entry['Override']) }
 
     & winget @wingetArgs
     if ($LASTEXITCODE -ne 0) {
@@ -503,16 +630,16 @@ function Invoke-Preflight {
         Write-Plain ''
         Write-Info 'missing build tools:'
         foreach ($m in $missing) {
-            Write-Plain "  $($m.Name)"
-            if ($m.Note) { Write-Plain "    $($m.Note)" }
+            Write-Plain "          $($m.Name)"
+            if ($m.ContainsKey('Note')) { Write-Detail "    $($m['Note'])" }
         }
         Write-Plain ''
 
         # One command per package rather than one line with every id. winget's positional argument
         # is a single query, so a multi-package line is not something to hand a reader as a
         # copy-paste, and printing exactly what runs matters more than printing it compactly.
-        Write-Plain 'Install them with:'
-        foreach ($m in $missing) { Write-Plain "    $(Get-WingetCommand $m)" }
+        Write-Info 'Install them with:'
+        foreach ($m in $missing) { Write-Detail "  $(Get-WingetCommand $m)" }
         Write-Plain ''
 
         # Offer, rather than refuse. Refusing and telling the reader to rerun with a switch made
@@ -797,60 +924,56 @@ cannot prompt, and this needs an answer: $Question
 function Get-Source([hashtable]$Source, [bool]$Recursive) {
     $dir = Join-Path $script:SrcDir $Source.Dir
 
+    $log = Join-Path $script:LogDir "fetch-$($Source.Dir).log"
     if (Test-Path (Join-Path $dir '.git')) {
-        Write-Info "updating $($Source.Dir) to $($Source.Ref)"
-        & git -C $dir fetch --tags --force origin
-        if ($LASTEXITCODE -ne 0) { Stop-WithError "git fetch failed in $dir" }
+        $code = Invoke-Logged -Label "updating $($Source.Dir) to $($Source.Ref)" -LogPath $log `
+            -Exe 'git' -Arguments @('-C', $dir, 'fetch', '--tags', '--force', 'origin')
+        if ($code -ne 0) { Show-LogTail $log; Stop-WithError "git fetch failed in $dir. Full log: $log" }
     } else {
-        Write-Info "cloning $($Source.Dir) at $($Source.Ref) (this is the slow part on a cold cache)"
-        & git clone --quiet $Source.Repo $dir
-        if ($LASTEXITCODE -ne 0) { Stop-WithError "git clone of $($Source.Repo) failed" }
+        $code = Invoke-Logged -Label "cloning $($Source.Dir) at $($Source.Ref)" -LogPath $log `
+            -Exe 'git' -Arguments @('clone', '--quiet', $Source.Repo, $dir)
+        if ($code -ne 0) { Show-LogTail $log; Stop-WithError "git clone of $($Source.Repo) failed. Full log: $log" }
     }
 
     & git -C $dir checkout --force $Source.Ref
     if ($LASTEXITCODE -ne 0) { Stop-WithError "could not check out $($Source.Ref) in $dir" }
 
     if ($Recursive) {
-        Write-Info "fetching $($Source.Dir) submodules"
-        & git -C $dir submodule update --init --recursive
-        if ($LASTEXITCODE -ne 0) { Stop-WithError "submodule checkout failed in $dir" }
+        $subLog = Join-Path $script:LogDir "submodules-$($Source.Dir).log"
+        $code = Invoke-Logged -Label "fetching $($Source.Dir) submodules" -LogPath $subLog `
+            -Exe 'git' -Arguments @('-C', $dir, 'submodule', 'update', '--init', '--recursive')
+        if ($code -ne 0) { Show-LogTail $subLog; Stop-WithError "submodule checkout failed in $dir. Full log: $subLog" }
     }
 
     $head = (& git -C $dir rev-parse --short HEAD)
-    Write-Info "$($Source.Dir) is at $head"
+    Write-Detail "$($Source.Dir) is at $head"
     return $dir
 }
 
-function Invoke-CargoBuild([string]$Directory, [string[]]$ExtraArgs) {
+function Invoke-CargoBuild([string]$Directory, [string]$Name, [string[]]$ExtraArgs) {
     $cargoArgs = @('build', '--release')
     if ($script:Jobs -gt 0) { $cargoArgs += @('-j', "$($script:Jobs)") }
     if ($ExtraArgs) { $cargoArgs += $ExtraArgs }
 
-    Write-Info "building in $Directory"
-    Write-Plain ''
-
-    # bindgen needs this, and a user-set value may be missing or wrong.
+    # bindgen needs this, and a user-set value may be missing or point at Visual Studio's LLVM,
+    # which ships no libclang.dll.
     $env:LIBCLANG_PATH = $script:LibClangPath
 
-    Push-Location $Directory
-    try {
-        # cargo output is not captured, so progress is visible. A silent twenty minute wait is
-        # indistinguishable from a hang.
-        & cargo @cargoArgs
-        $code = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
+    $log = Join-Path $script:LogDir "build-$Name.log"
+    $code = Invoke-Logged -Label "compiling $Name" -LogPath $log `
+        -Exe 'cargo' -Arguments $cargoArgs -WorkingDirectory $Directory
 
-    Write-Plain ''
     if ($code -ne 0) {
+        Show-LogTail $log
         Stop-WithError @"
-the build failed in $Directory.
-    The cargo error above is the real cause. Common ones on Windows:
-      - a Windows SDK older than $MinWindowsSdk, which fails on stdalign.h
-      - LIBCLANG_PATH pointing at Visual Studio's LLVM, which has no libclang.dll
-      - the msys perl from Git for Windows ahead of Strawberry Perl on PATH
-    Sources are kept at $Directory, so you can retry there without recloning.
+the build of $Name failed.
+        The cargo error above is the real cause. The usual ones on Windows are a Windows SDK
+        older than $MinWindowsSdk, which fails on stdalign.h, LIBCLANG_PATH pointing at Visual
+        Studio's LLVM, which has no libclang.dll, or Git for Windows' msys perl sitting ahead of
+        Strawberry Perl on PATH.
+
+        Full log:  $log
+        Sources:   $Directory  (kept, so a retry does not reclone)
 "@
     }
 }
@@ -861,11 +984,11 @@ function Build-Component([string]$Name) {
     switch ($Name) {
         'node' {
             $dir = Get-Source -Source $source -Recursive $false
-            Invoke-CargoBuild -Directory $dir -ExtraArgs $(if ($script:WithTor) { @('--features', 'with-tor') } else { @() })
+            Invoke-CargoBuild -Directory $dir -Name 'node' -ExtraArgs $(if ($script:WithTor) { @('--features', 'with-tor') } else { @() })
         }
         'wallet' {
             $dir = Get-Source -Source $source -Recursive $false
-            Invoke-CargoBuild -Directory $dir -ExtraArgs $(if ($script:WithTor) { @('--features', 'with-tor') } else { @() })
+            Invoke-CargoBuild -Directory $dir -Name 'wallet' -ExtraArgs $(if ($script:WithTor) { @('--features', 'with-tor') } else { @() })
         }
         'miner' {
             $dir = Get-Source -Source $source -Recursive $true
@@ -884,7 +1007,7 @@ function Build-Component([string]$Name) {
                 # there is no tui feature in the manifest and cargo rejects it outright.
                 'cuda' { @('--no-default-features', '--features', 'cuda') }
             }
-            Invoke-CargoBuild -Directory $dir -ExtraArgs $extra
+            Invoke-CargoBuild -Directory $dir -Name 'miner' -ExtraArgs $extra
         }
     }
 }
@@ -1148,7 +1271,7 @@ function Invoke-FastSync {
 
     # A content filter, a proxy or an error page will happily arrive with a 200, so check the magic
     # bytes rather than trusting the extension.
-    $magic = [System.IO.File]::ReadAllBytes($zip) | Select-Object -First 2
+    $magic = @([System.IO.File]::ReadAllBytes($zip) | Select-Object -First 2)
     if ($magic.Count -lt 2 -or $magic[0] -ne 0x50 -or $magic[1] -ne 0x4B) {
         Set-FastSyncFailed @"
 what arrived from $($script:BootstrapUrl) is not a zip archive.
@@ -1325,9 +1448,6 @@ function Write-Uninstaller {
 
 # An install is not finished because the copy succeeded. Run each binary and show its version.
 function Test-Install {
-    Write-Plain ''
-    Write-Info 'verifying'
-
     $failed = @()
     foreach ($name in Get-SelectedComponents) {
         $exe = if ($name -eq 'miner') {
@@ -1339,7 +1459,7 @@ function Test-Install {
         try {
             $version = (& $exe --version 2>&1 | Select-Object -First 1)
             if ($LASTEXITCODE -ne 0) { throw 'nonzero exit' }
-            Write-Plain ("  {0,-8}{1}" -f $name, $version)
+            Write-Ok $version
         } catch {
             $failed += $name
         }
@@ -1400,7 +1520,8 @@ function Show-NextSteps {
 
 function Show-Plan {
     Write-Plain ''
-    Write-Plain "Epic Cash source installer $InstallerVersion"
+    Write-Host '  Epic Cash' -NoNewline -ForegroundColor White
+    Write-Host " source installer $InstallerVersion" -ForegroundColor DarkGray
     Write-Plain ''
     Write-Plain "  platform    windows $($script:HostArch)"
     Write-Plain "  building    $((Get-SelectedComponents) -join ' ')"
@@ -1439,46 +1560,67 @@ function Invoke-Main {
     $script:ChainBackup = $null
     $script:FastSyncStatus = 'not requested'
 
+    Initialize-Style
     Assert-PowerShellVersion
     Resolve-Settings
     $script:HostArch = Get-HostArchitecture
 
+    # Counted up front so the step numbers mean something. Four fixed steps, being the toolchain
+    # check, Rust, the install and the verify, then one per component, plus the snapshot when it
+    # was asked for.
+    $script:StepTotal = 4 + @(Get-SelectedComponents).Count
+    if ($script:FastSync) { $script:StepTotal++ }
+
     Show-Plan
+
+    Write-Step 'Checking the toolchain'
     Invoke-Preflight
 
     if ($script:Check) {
         Write-Plain ''
-        Write-Info 'check complete. Nothing was changed. Drop -Check to install.'
+        Write-Ok 'check complete, nothing was changed. Drop -Check to install.'
+        Write-Plain ''
         return
     }
 
+    Write-Plain ''
     if (-not (Confirm-Action 'Build and install the above?')) {
         Write-Info 'cancelled, nothing was changed'
         return
     }
 
+    Write-Step 'Rust toolchain'
     Install-RustIfMissing
 
-    foreach ($dir in @($script:SrcDir, $script:BinDir, $script:MetaDir)) {
+    foreach ($dir in @($script:SrcDir, $script:BinDir, $script:MetaDir, $script:LogDir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
 
     $script:Receipt = Join-Path $script:MetaDir 'receipt.txt'
     Set-Content -LiteralPath $script:Receipt -Value @() -Encoding ascii
 
-    foreach ($name in Get-SelectedComponents) { Build-Component -Name $name }
+    foreach ($name in Get-SelectedComponents) {
+        Write-Step ([cultureinfo]::InvariantCulture.TextInfo.ToTitleCase($name))
+        Build-Component -Name $name
+    }
 
+    Write-Step 'Installing'
     foreach ($name in Get-SelectedComponents) {
         if ($name -eq 'miner') { Install-Miner } else { Install-ComponentBinary -Name $name }
     }
 
     Add-ToUserPath -Directory $script:BinDir
     Write-Uninstaller
+
+    Write-Step 'Verifying'
     Test-Install
 
     # After verification, so a failed build or a broken binary is reported before committing to a
     # multi-gigabyte download.
-    if ($script:FastSync) { Invoke-FastSync }
+    if ($script:FastSync) {
+        Write-Step 'Chain snapshot'
+        Invoke-FastSync
+    }
 
     Show-NextSteps
 }

@@ -256,6 +256,25 @@ Things found while building this that are worth knowing:
 - Release asset checksums published in GitHub release notes have disagreed with the actual files.
   Trust the `-sha256sum.txt` sidecar or the API digest, not the notes.
 
+## Output
+
+Steps are numbered, so a twenty minute compile is not a mystery. Long operations show a spinner
+with elapsed time rather than the thousands of lines cargo and git produce, and those lines go to a
+log instead:
+
+```
+[3/5] Node
+        ✓ cloning epic at v4.0.3  0m19s
+        epic is at 650b783
+        ✓ compiling node  6m04s
+```
+
+When something fails, the last 25 lines of the log are printed, because that is where the error is,
+and the full log path is given. Logs live in `~/.epic/install/logs`.
+
+Colour and the spinner are used only when stdout is a terminal. Redirect it, or set `NO_COLOR`, and
+the output is plain text with no escape codes.
+
 ## Design
 
 The script is deliberately boring, and structured so you can audit it in one sitting.
@@ -272,6 +291,8 @@ The script is deliberately boring, and structured so you can audit it in one sit
 - Every installed path is recorded in a receipt that accumulates across runs, and the uninstaller is
   generated from it.
 - Nothing is reported as installed until the binary has been run and its version printed.
+- Noisy commands run through one helper that logs their output, times them, and shows the tail of
+  the log only on failure.
 
 ## Licence
 
