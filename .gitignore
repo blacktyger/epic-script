@@ -1,0 +1,5 @@
+# Nothing in this repository is generated or built. The two scripts and the docs are the whole
+# thing, deliberately: the one-liner has to work from a bare curl with nothing else fetched.
+.DS_Store
+Thumbs.db
+*.log
