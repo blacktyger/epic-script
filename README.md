@@ -1,4 +1,4 @@
-# epic-install
+# epic-script
 
 One command to build and install [Epic Cash](https://github.com/EpicCash) from source: the node,
 the wallet, the miner, or the node and wallet together.

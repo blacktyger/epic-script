@@ -184,7 +184,7 @@ $ChainMarkers = @('lmdb', 'txhashset', 'header', 'chain', 'peer')
 # ---------------------------------------------------------------------------
 
 function Write-Info([string]$Message) {
-    Write-Host "epic-install: $Message"
+    Write-Host "epic-script: $Message"
 }
 
 function Write-Plain([string]$Message) {
@@ -192,11 +192,11 @@ function Write-Plain([string]$Message) {
 }
 
 function Write-Warn([string]$Message) {
-    Write-Host "epic-install: warning: $Message" -ForegroundColor Yellow
+    Write-Host "epic-script: warning: $Message" -ForegroundColor Yellow
 }
 
 function Stop-WithError([string]$Message) {
-    Write-Host "epic-install: error: $Message" -ForegroundColor Red
+    Write-Host "epic-script: error: $Message" -ForegroundColor Red
     exit 1
 }
 
@@ -312,33 +312,69 @@ function Test-Command([string]$Name) {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+# Does a file exist at this absolute path, without ever throwing?
+#
+# Join-Path and Test-Path both resolve the drive qualifier through the PowerShell provider, so a
+# candidate path on a drive the machine does not have throws rather than returning false:
+#
+#   Cannot find drive. A drive with the name 'D' does not exist.
+#
+# With $ErrorActionPreference = 'Stop' that aborts the whole install, which is what happened to the
+# first person to run this on a machine with no D: drive. [System.IO.Path]::Combine is pure string
+# work and touches no provider, and the Test-Path is guarded both ways.
+function Test-FileAt([string]$Directory, [string]$Leaf) {
+    if (-not $Directory) { return $false }
+    try {
+        $full = [System.IO.Path]::Combine($Directory, $Leaf)
+        return (Test-Path -LiteralPath $full -PathType Leaf -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
 # bindgen loads libclang.dll at build time. The LLVM component bundled with Visual Studio
 # ships only clang-format and clang-tidy, so a real LLVM install is needed.
 function Find-LibClang {
-    if ($env:LIBCLANG_PATH -and (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
+    if (Test-FileAt $env:LIBCLANG_PATH 'libclang.dll') {
         return $env:LIBCLANG_PATH
     }
 
+    # Where the LLVM installer and the common package managers put it. No non-system drive is
+    # guessed: a hardcoded D:\LLVM\bin here is what threw on the first Windows machine to run this,
+    # and guessing drive letters is not a substitute for LIBCLANG_PATH anyway.
     $candidates = @(
-        'C:\Program Files\LLVM\bin'
-        'C:\Program Files (x86)\LLVM\bin'
-        'D:\LLVM\bin'
+        [System.IO.Path]::Combine($env:ProgramFiles, 'LLVM\bin')
+        [System.IO.Path]::Combine(${env:ProgramFiles(x86)}, 'LLVM\bin')
+        [System.IO.Path]::Combine($env:LOCALAPPDATA, 'Programs\LLVM\bin')
+        [System.IO.Path]::Combine($env:ChocolateyInstall, 'lib\llvm\tools\LLVM\bin')
     )
     foreach ($dir in $candidates) {
-        if (Test-Path (Join-Path $dir 'libclang.dll')) { return $dir }
+        if (Test-FileAt $dir 'libclang.dll') { return $dir }
     }
 
+    # Anything on PATH wins over a guess, including an install on a drive we would never try.
     if (Test-Command 'clang') {
         $clangDir = Split-Path (Get-Command 'clang').Source -Parent
-        if (Test-Path (Join-Path $clangDir 'libclang.dll')) { return $clangDir }
+        if (Test-FileAt $clangDir 'libclang.dll') { return $clangDir }
     }
 
     return $null
 }
 
 function Find-VisualStudio {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (-not (Test-Path $vswhere)) { return $null }
+    # vswhere ships with the VS Installer. It is normally under Program Files (x86) even for a
+    # 64-bit install, but both roots are checked because that is not guaranteed, and Combine is used
+    # so an unset variable yields no candidate rather than a thrown Join-Path.
+    $roots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles) | Where-Object { $_ }
+    $vswhere = $null
+    foreach ($root in $roots) {
+        $candidate = [System.IO.Path]::Combine($root, 'Microsoft Visual Studio\Installer\vswhere.exe')
+        if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction SilentlyContinue) {
+            $vswhere = $candidate
+            break
+        }
+    }
+    if (-not $vswhere) { return $null }
 
     $path = & $vswhere -latest -products '*' `
         -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
@@ -349,13 +385,11 @@ function Find-VisualStudio {
 
 # Returns the newest installed Windows SDK version, or $null.
 function Get-NewestWindowsSdk {
-    $roots = @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include')
-        (Join-Path $env:ProgramFiles 'Windows Kits\10\Include')
-    )
+    $roots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles) | Where-Object { $_ }
     $versions = foreach ($root in $roots) {
-        if (-not (Test-Path $root)) { continue }
-        Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $include = [System.IO.Path]::Combine($root, 'Windows Kits\10\Include')
+        if (-not (Test-Path -LiteralPath $include -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $include -Directory -ErrorAction SilentlyContinue | ForEach-Object {
             $parsed = $null
             if ([version]::TryParse($_.Name, [ref]$parsed)) { $parsed }
         }
@@ -367,11 +401,21 @@ function Get-NewestWindowsSdk {
 # Strawberry Perl, specifically. The miner's vendored OpenSSL runs OpenSSL's Configure, which
 # rejects the msys perl that ships with Git for Windows because it emits forward-slash paths.
 function Find-StrawberryPerl {
-    foreach ($dir in @('C:\Strawberry\perl\bin', 'D:\Strawberry\perl\bin')) {
-        if (Test-Path (Join-Path $dir 'perl.exe')) { return $dir }
+    # Strawberry's own installer default, plus the Chocolatey and Scoop locations. Same rule as
+    # libclang: no drive letters are guessed, and anything on PATH beats a guess.
+    $candidates = @(
+        [System.IO.Path]::Combine($env:SystemDrive + '\', 'Strawberry\perl\bin')
+        [System.IO.Path]::Combine($env:ChocolateyInstall, 'lib\strawberryperl\tools\perl\bin')
+        [System.IO.Path]::Combine($env:USERPROFILE, 'scoop\apps\perl\current\perl\bin')
+    )
+    foreach ($dir in $candidates) {
+        if (Test-FileAt $dir 'perl.exe') { return $dir }
     }
+
     if (Test-Command 'perl') {
         $perl = (Get-Command 'perl').Source
+        # Git for Windows ships an msys perl that OpenSSL's Configure rejects, because it emits
+        # forward-slash paths. Finding that one is worse than finding none.
         if ($perl -notmatch 'Git|usr\\bin|msys') { return (Split-Path $perl -Parent) }
     }
     return $null
@@ -867,7 +911,7 @@ function Install-Miner {
     $launcher = Join-Path $script:BinDir 'epic-miner.cmd'
     $launcherBody = @"
 @echo off
-rem Generated by epic-install. Supplies the plugin directory and a working directory
+rem Generated by epic-script. Supplies the plugin directory and a working directory
 rem containing epic-miner.toml, neither of which the miner can find on its own.
 setlocal
 set "EPIC_MINER_HOME=$($script:MinerHome)"
@@ -1169,7 +1213,7 @@ function Add-ToUserPath([string]$Directory) {
 function Write-Uninstaller {
     $lines = [System.Collections.Generic.List[string]]::new()
 
-    $lines.Add('# Generated by epic-install. Removes what the installer added, and nothing else.')
+    $lines.Add('# Generated by epic-script. Removes what the installer added, and nothing else.')
     $lines.Add('#')
     $lines.Add('#   powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Epic\install\uninstall.ps1"')
     $lines.Add('#   ... -PurgeData     also removes chain data and wallets')
