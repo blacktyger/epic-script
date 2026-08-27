@@ -915,6 +915,35 @@ function Install-ChainPayload([string]$Payload, [string]$ChainDir, [string]$Stag
     Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# Guidance printed whenever the snapshot cannot be fetched or used. The install itself has already
+# succeeded by this point, so this is advice, not an error.
+function Show-BootstrapManualHelp {
+    $chain = Join-Path $script:EpicMainHome 'chain_data'
+    Write-Plain ''
+    Write-Plain '    The node and wallet are installed and work. Only the snapshot is missing, so the'
+    Write-Plain '    node will validate from genesis instead. That is slower, and it is also the'
+    Write-Plain '    stronger guarantee, so it is a perfectly good outcome.'
+    Write-Plain ''
+    Write-Plain '    To bootstrap by hand later, from a machine or network that can reach the file:'
+    Write-Plain ''
+    Write-Plain "        Invoke-WebRequest $($script:BootstrapUrl) -OutFile bootstrap.zip"
+    Write-Plain '        Expand-Archive bootstrap.zip -DestinationPath .'
+    Write-Plain '        # the archive holds a chain_data directory. Move it here:'
+    Write-Plain "        Move-Item chain_data '$chain'"
+    Write-Plain ''
+    Write-Plain '    Stop the node first if it is running, and open the file in a browser if the'
+    Write-Plain '    download fails: a home or corporate content filter blocking the host is a common'
+    Write-Plain '    cause, and it returns a web page rather than an archive.'
+    Write-Plain "        $($script:BootstrapUrl)"
+}
+
+# Records the outcome, so fast sync failing never fails the install.
+function Set-FastSyncFailed([string]$Message) {
+    $script:FastSyncStatus = 'failed'
+    Write-Warn $Message
+    Show-BootstrapManualHelp
+}
+
 function Invoke-FastSync {
     $epicHome = $script:EpicMainHome
     $chain = Join-Path $epicHome 'chain_data'
@@ -935,6 +964,7 @@ function Invoke-FastSync {
         Write-Plain '    touched either way, and a node that is currently running must be stopped first.'
         if (-not (Confirm-Action "Replace the existing chain data at $chain?")) {
             Write-Info 'keeping the existing chain data, skipping fast sync'
+            $script:FastSyncStatus = 'skipped'
             return
         }
     }
@@ -950,10 +980,8 @@ function Invoke-FastSync {
             $drive = Get-PSDrive -Name $root.TrimEnd(':\') -ErrorAction Stop
             $freeMb = [int]($drive.Free / 1MB)
             if ($freeMb -lt $needed) {
-                Stop-WithError @"
-not enough free disk space for the snapshot: $freeMb MiB available, about $needed MiB needed.
-    Free some space, or omit -FastSync and let the node sync.
-"@
+                Set-FastSyncFailed "not enough free disk space for the snapshot: $freeMb MiB available, about $needed MiB needed."
+                return
             }
         } catch {
             Write-Warn 'could not check free space before downloading.'
@@ -983,14 +1011,16 @@ not enough free disk space for the snapshot: $freeMb MiB available, about $neede
         $curlArgs += @('-o', $zip, $script:BootstrapUrl)
         & curl.exe @curlArgs
         if ($LASTEXITCODE -ne 0) {
-            Stop-WithError @"
-could not download the snapshot from $($script:BootstrapUrl)
-    The node and wallet are installed and work regardless; they will just sync from genesis.
-    Retry later, or pass -BootstrapUrl with a mirror.
-"@
+            Set-FastSyncFailed "could not download the snapshot from $($script:BootstrapUrl)"
+            return
         }
     } else {
-        Invoke-Download -Url $script:BootstrapUrl -Destination $zip
+        try {
+            Invoke-Download -Url $script:BootstrapUrl -Destination $zip
+        } catch {
+            Set-FastSyncFailed "could not download the snapshot from $($script:BootstrapUrl)"
+            return
+        }
     }
     Write-Plain ''
 
@@ -998,11 +1028,12 @@ could not download the snapshot from $($script:BootstrapUrl)
     # bytes rather than trusting the extension.
     $magic = [System.IO.File]::ReadAllBytes($zip) | Select-Object -First 2
     if ($magic.Count -lt 2 -or $magic[0] -ne 0x50 -or $magic[1] -ne 0x4B) {
-        Stop-WithError @"
+        Set-FastSyncFailed @"
 what arrived from $($script:BootstrapUrl) is not a zip archive.
-    That usually means a captive portal, a proxy or an ISP filter returned a web page instead.
+    A captive portal, a proxy or an ISP content filter returning a web page is the usual cause.
     The file is at $zip if you want to look at it.
 "@
+        return
     }
 
     Write-Info 'unpacking'
@@ -1019,27 +1050,35 @@ what arrived from $($script:BootstrapUrl) is not a zip archive.
         if (Test-Command 'tar.exe') {
             # tar handles multi-gigabyte zips far better than Expand-Archive.
             & tar.exe -xf $zip -C $extracted
-            if ($LASTEXITCODE -ne 0) { Stop-WithError "could not unpack $zip" }
+            if ($LASTEXITCODE -ne 0) {
+                Set-FastSyncFailed "the snapshot downloaded but will not unpack, so it is probably truncated. Delete $zip and try again."
+                return
+            }
         } else {
             Expand-Archive -LiteralPath $zip -DestinationPath $extracted -Force
         }
+    } catch {
+        Set-FastSyncFailed "the snapshot downloaded but will not unpack, so it is probably truncated. Delete $zip and try again."
+        return
     } finally {
         $global:ProgressPreference = $progress
     }
 
     $payload = Find-ChainPayload -Staging $extracted
     if (-not $payload) {
-        Stop-WithError @"
+        Set-FastSyncFailed @"
 unpacked the snapshot but found no chain database inside it.
     Expected a chain_data directory, or one containing any of: $($ChainMarkers -join ', ')
     The unpacked files are at $extracted if you want to move them by hand.
 "@
+        return
     }
     Write-Info "found the chain database at $payload"
 
     Install-ChainPayload -Payload $payload -ChainDir $chain -Staging $staging -Zip $zip
     Write-Info 'removed the archive and the staging directory'
     Write-Info "chain data is in place at $chain"
+    $script:FastSyncStatus = 'ok'
 
     if ($script:ChainBackup) {
         Write-Plain ''
@@ -1214,10 +1253,14 @@ function Show-NextSteps {
     if (Test-WantNode) {
         Write-Plain 'Node:   epic server config     writes epic-server.toml in the current directory'
         Write-Plain '        epic server run        starts syncing mainnet'
-        if ($script:FastSync) {
+        if ($script:FastSyncStatus -eq 'ok') {
             Write-Plain "        The snapshot is in $(Join-Path $script:EpicMainHome 'chain_data'), which is where the"
             Write-Plain '        node looks by default. Running the node from a directory that has its own'
             Write-Plain "        epic-server.toml uses that config's db_root instead, and ignores it."
+        } elseif ($script:FastSyncStatus -eq 'failed') {
+            Write-Plain '        The snapshot could not be fetched, so the first run validates from'
+            Write-Plain '        genesis and will take hours. That is normal and safe. Manual'
+            Write-Plain '        bootstrap instructions were printed above.'
         }
     }
     if (Test-WantWallet) {
@@ -1272,6 +1315,7 @@ function Invoke-Main {
     $script:PerlPath = $null
     $script:CmakeNeedsPatch = $false
     $script:ChainBackup = $null
+    $script:FastSyncStatus = 'not requested'
 
     Assert-PowerShellVersion
     Resolve-Settings

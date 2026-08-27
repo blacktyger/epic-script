@@ -879,6 +879,35 @@ place_chain_payload() {
 	rmdir "$_staging" 2>/dev/null || true
 }
 
+# Guidance printed whenever the snapshot cannot be fetched or used. The install itself has already
+# succeeded by this point, so this is advice, not an error.
+bootstrap_manual_help() {
+	say_bare ""
+	say_bare "    The node and wallet are installed and work. Only the snapshot is missing, so the"
+	say_bare "    node will validate from genesis instead. That is slower, and it is also the"
+	say_bare "    stronger guarantee, so it is a perfectly good outcome."
+	say_bare ""
+	say_bare "    To bootstrap by hand later, from a machine or network that can reach the file:"
+	say_bare ""
+	say_bare "        curl -LO $BOOTSTRAP_URL"
+	say_bare "        unzip bootstrap.zip"
+	say_bare "        # the archive holds a chain_data directory. Move it here:"
+	say_bare "        mv chain_data \"$HOME/.epic/main/chain_data\""
+	say_bare ""
+	say_bare "    Stop the node first if it is running, and check the file in a browser if curl"
+	say_bare "    fails: a home or corporate content filter blocking the host is a common cause,"
+	say_bare "    and it returns a web page rather than an archive."
+	say_bare "        $BOOTSTRAP_URL"
+}
+
+# Records the outcome and returns non-zero, so fast sync failing never fails the install.
+fast_sync_failed() {
+	FAST_SYNC_STATUS="failed"
+	warn "$1"
+	bootstrap_manual_help
+	return 1
+}
+
 fast_sync() {
 	_home="$HOME/.epic/main"
 	_chain="$_home/chain_data"
@@ -898,6 +927,7 @@ fast_sync() {
 		say_bare "    touched either way, and a node that is currently running must be stopped first."
 		if ! confirm "Replace the existing chain data at $_chain?"; then
 			say "keeping the existing chain data, skipping fast sync"
+			FAST_SYNC_STATUS="skipped"
 			return 0
 		fi
 	fi
@@ -912,8 +942,9 @@ fast_sync() {
 		_have="$(free_mb "$_home")"
 		say "snapshot is about ${_size} MiB, so about ${_need} MiB is needed to unpack it"
 		if [ -n "$_have" ] && [ "$_have" -lt "$_need" ]; then
-			err "not enough free disk space for the snapshot: ${_have} MiB available,
-    about ${_need} MiB needed. Free some space, or omit --fast-sync and let the node sync."
+			fast_sync_failed "not enough free disk space for the snapshot: ${_have} MiB available,
+    about ${_need} MiB needed."
+			return 0
 		fi
 	else
 		warn "the server did not report a size, so free space cannot be checked in advance"
@@ -943,26 +974,28 @@ fast_sync() {
 		# _resume_curl is intentionally word-split: it is either empty or `-C -`.
 		if ! curl --proto '=https' --tlsv1.2 -fL --retry 3 $_resume_curl --progress-bar \
 			-o "$_zip" "$BOOTSTRAP_URL"; then
-			err "could not download the snapshot from $BOOTSTRAP_URL
-    The node and wallet are installed and work regardless; they will just sync from genesis.
-    Retry later, or pass --bootstrap-url with a mirror."
+			fast_sync_failed "could not download the snapshot from $BOOTSTRAP_URL"
+			return 0
 		fi
 	elif check_cmd wget; then
 		# shellcheck disable=SC2086
 		if ! wget --https-only $_resume_wget -O "$_zip" "$BOOTSTRAP_URL"; then
-			err "could not download the snapshot from $BOOTSTRAP_URL"
+			fast_sync_failed "could not download the snapshot from $BOOTSTRAP_URL"
+			return 0
 		fi
 	else
-		err "need curl or wget to download the snapshot"
+		fast_sync_failed "need curl or wget to download the snapshot, and neither is on PATH"
+		return 0
 	fi
 	say_bare ""
 
 	# A content filter, a proxy or an error page will happily arrive with a 200, so check the
 	# magic bytes rather than trusting the extension.
 	if [ "$(dd if="$_zip" bs=2 count=1 2>/dev/null)" != "PK" ]; then
-		err "what arrived from $BOOTSTRAP_URL is not a zip archive.
-    That usually means a captive portal, a proxy or an ISP filter returned a web page instead.
+		fast_sync_failed "what arrived from $BOOTSTRAP_URL is not a zip archive.
+    A captive portal, a proxy or an ISP content filter returning a web page is the usual cause.
     The file is at $_zip if you want to look at it."
+		return 0
 	fi
 
 	say "unpacking"
@@ -970,19 +1003,29 @@ fast_sync() {
 	# contents of this archive.
 	rm -rf "$_staging/extracted"
 	if check_cmd unzip; then
-		ensure unzip -q -o "$_zip" -d "$_staging/extracted"
+		if ! unzip -q -o "$_zip" -d "$_staging/extracted"; then
+			fast_sync_failed "the snapshot downloaded but will not unpack, so it is probably
+    truncated. Delete $_zip and try again."
+			return 0
+		fi
 	elif check_cmd python3; then
-		ensure python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
-			"$_zip" "$_staging/extracted"
+		if ! python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+			"$_zip" "$_staging/extracted"; then
+			fast_sync_failed "the snapshot downloaded but will not unpack, so it is probably
+    truncated. Delete $_zip and try again."
+			return 0
+		fi
 	else
-		err "need unzip or python3 to unpack the snapshot"
+		fast_sync_failed "need unzip or python3 to unpack the snapshot, and neither is on PATH"
+		return 0
 	fi
 
 	_payload="$(find_chain_payload "$_staging/extracted")" || _payload=""
 	if [ -z "$_payload" ]; then
-		err "unpacked the snapshot but found no chain database inside it.
+		fast_sync_failed "unpacked the snapshot but found no chain database inside it.
     Expected a chain_data directory, or one containing any of: $CHAIN_MARKERS
     The unpacked files are at $_staging/extracted if you want to move them by hand."
+		return 0
 	fi
 	say "found the chain database at ${_payload#"$_staging/extracted/"}"
 
@@ -990,6 +1033,7 @@ fast_sync() {
 	say "removed the archive and the staging directory"
 
 	say "chain data is in place at $_chain"
+	FAST_SYNC_STATUS="ok"
 	if [ -n "$CHAIN_BACKUP" ]; then
 		say_bare ""
 		say "your previous chain data was moved to $CHAIN_BACKUP rather than deleted."
@@ -1222,10 +1266,14 @@ next_steps() {
 	if want_node; then
 		say_bare "Node:   epic server config     writes epic-server.toml in the current directory"
 		say_bare "        epic server run        starts syncing mainnet"
-		if [ "$FAST_SYNC" = "1" ]; then
+		if [ "$FAST_SYNC_STATUS" = "ok" ]; then
 			say_bare "        The snapshot is in ~/.epic/main/chain_data, which is where the node looks"
 			say_bare "        by default. Running the node from a directory that has its own"
 			say_bare "        epic-server.toml uses that config's db_root instead, and ignores it."
+		elif [ "$FAST_SYNC_STATUS" = "failed" ]; then
+			say_bare "        The snapshot could not be fetched, so the first run validates from"
+			say_bare "        genesis and will take hours. That is normal and safe. Manual"
+			say_bare "        bootstrap instructions were printed above."
 		fi
 	fi
 	if want_wallet; then
@@ -1480,6 +1528,8 @@ main() {
 	NO_PATCH_CMAKE="${EPIC_NO_PATCH_CMAKE:-0}"
 	FAST_SYNC="${EPIC_FAST_SYNC:-0}"
 	BOOTSTRAP_URL="${EPIC_BOOTSTRAP_URL:-$BOOTSTRAP_URL_DEFAULT}"
+	FAST_SYNC_STATUS="not requested"
+	CHAIN_BACKUP=""
 	CMAKE_NEEDS_PATCH=0
 
 	PATH_NEEDS_RELOAD=0
