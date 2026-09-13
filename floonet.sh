@@ -27,7 +27,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/floonet.sh | less
 #
 # See what it would do and change nothing:
-#   curl -fsSL .../floonet.sh | sh -s -- --check
+#   curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/floonet.sh | sh -s -- --check
 #
 # MIT licensed. Not an official Epic Cash project.
 
@@ -148,7 +148,7 @@ Options                        Variable                   Meaning
   -h, --help
 
 Piping to sh has no terminal, so unattended runs need --yes:
-  curl -fsSL .../floonet.sh | sh -s -- --yes --install-deps
+  curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/floonet.sh | sh -s -- --yes --install-deps
 
 No wallet is installed. The node mines with burn_reward = true, which mints each coinbase to a
 throwaway key, so there is nothing to configure and nothing to lose.

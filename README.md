@@ -295,8 +295,8 @@ curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/floonet
 Read it first, or see what it would do and change nothing:
 
 ```sh
-curl -fsSL .../floonet.sh | less
-curl -fsSL .../floonet.sh | sh -s -- --check
+curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/floonet.sh | less
+curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/floonet.sh | sh -s -- --check
 ```
 
 It delegates every build to `install.sh`, so there is one source of truth for compiling, and
