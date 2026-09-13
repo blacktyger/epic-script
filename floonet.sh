@@ -14,7 +14,7 @@
 #     only_randomx = true                 without it your node rejects every block on the chain
 #     chain_type = "Floonet"              the --floonet flag alone is not enough, see below
 #     seeding_type / seeds                floonet's hardcoded DNS seed does not exist
-#     peer_min_preferred_outbound_count   without it the node never leaves "awaiting_peers"
+#     peer_min_preferred_outbound_count = 1   1, not 0: 0 leaves the node stuck at height 0
 #     enable_stratum_server = true        the miner needs something to talk to
 #     burn_reward = true                  mine with no wallet at all
 #
@@ -697,13 +697,30 @@ toml_set "$SERVER_TOML" "server.p2p_config" "seeding_type" '"List"'
 toml_set "$SERVER_TOML" "server.p2p_config" "seeds" "[\"$SEED_SOCKADDR\"]"
 toml_set "$SERVER_TOML" "server.p2p_config" "port" "$P2P_PORT"
 
-# 4. peer_min_preferred_outbound_count. Non-obvious and absolutely required.
-#    The sync loop's first action each iteration is: if fewer than this many OUTBOUND peers,
-#    set AwaitingPeers and `continue`. The default is 4. A small test network has one seed, so
-#    a joining node reaches exactly 1 outbound peer, never satisfies the check, and stays in
-#    "awaiting_peers" forever - never reaching the branch that sets NoSync. The stratum server
-#    then never serves work and the whole thing looks broken for no visible reason.
-toml_set "$SERVER_TOML" "server.p2p_config" "peer_min_preferred_outbound_count" "0"
+# 4. peer_min_preferred_outbound_count. Non-obvious, absolutely required, and 1 rather than 0.
+#    The sync loop begins each iteration by checking whether it has at least this many OUTBOUND
+#    peers; below that it sets AwaitingPeers and `continue`s. The default is 4. A small test
+#    network has one seed, so a joining node reaches exactly 1 outbound peer, never satisfies the
+#    check, and stays in "awaiting_peers" forever - never reaching the branch that sets NoSync.
+#    The stratum server then never serves work and the whole thing looks broken for no reason.
+#
+#    0 looks like the safe answer and is worse. With 0 the guard passes immediately, so the node
+#    reaches NoSync *before any peer connects*. From NoSync, needs_syncing() takes its other
+#    branch and only re-enables sync when
+#
+#        peer_difficulty > local_difficulty + sum(last 5 block difficulties)
+#
+#    Floonet's genesis seeds ProgPow at 2^26 = 67108864, and a RandomX-only chain never
+#    meaningfully increments it - at height 203 the seed offers ProgPow 67109067, i.e. 203 above
+#    genesis - while the threshold is roughly twice the genesis value. That margin is never
+#    reached. The node handshakes, holds a healthy connection, logs that the seed has more work,
+#    and sits at height 0 forever. Worse here than on a plain node: burn_reward = true means it
+#    also mines, so it builds its own chain from genesis instead of following the network.
+#
+#    1 keeps the node in its startup AwaitingPeers state until the first peer connects, so
+#    needs_syncing() takes the is_syncing branch, sees the seed ahead, and syncs normally.
+#    Measured against the public seed: 0 -> stuck at height 0; 1 -> synced genesis to tip.
+toml_set "$SERVER_TOML" "server.p2p_config" "peer_min_preferred_outbound_count" "1"
 
 # 5/6. Stratum, and mining with no wallet.
 #    burn_reward = true makes the node pass None as the wallet listener URL, which routes
@@ -828,6 +845,38 @@ while [ "$_i" -lt 40 ]; do
 	fi
 done
 
+# Did it actually leave height 0? Polled while the node is still running.
+#
+# Everything else above can pass on a node that never syncs a single block. A wrong
+# peer_min_preferred_outbound_count produces exactly that: correct policy, working API,
+# stratum up, seed dialled - and a chain that stays at genesis forever. This is the check
+# that catches it, so do not remove it.
+_ok_sync=0
+_height=""
+_secret_file="$FLOO_DIR/.api_secret"
+if [ -r "$_secret_file" ]; then
+	_i=0
+	while [ "$_i" -lt 25 ]; do
+		_i=$((_i + 1))
+		kill -0 "$_node_pid" 2>/dev/null || break
+		_status=$(curl -fsS --max-time 3 -u "epic:$(cat "$_secret_file")" \
+			"http://127.0.0.1:$API_PORT/v1/status" 2>/dev/null || true)
+		if [ -n "$_status" ]; then
+			# no jq dependency: pull the first "height":N out of the response
+			_height=$(printf '%s' "$_status" | tr ',{}' '\n\n\n' \
+				| sed -n 's/.*"height"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -n 1)
+			case "$_height" in
+			'' | 0) : ;;
+			*)
+				_ok_sync=1
+				break
+				;;
+			esac
+		fi
+		sleep 1
+	done
+fi
+
 if kill -0 "$_node_pid" 2>/dev/null; then
 	kill -TERM "$_node_pid" 2>/dev/null
 	wait "$_node_pid" 2>/dev/null
@@ -857,6 +906,21 @@ fi
 
 if grep -q "Connecting to seed and preferred peers address: $SEED_SOCKADDR" "$_verify_log" 2>/dev/null; then
 	ok "the node dialled the seed at $SEED_SOCKADDR"
+fi
+
+if [ "$_ok_sync" = "1" ]; then
+	ok "the node synced past genesis (height $_height), so it is following the network"
+elif [ -r "$_secret_file" ]; then
+	printf '\n'
+	warn "the node started cleanly but is still at height 0 - it is not following the chain"
+	say "Everything else verified, so this is almost certainly connectivity or the sync
+        threshold rather than your build:
+          * can this host reach $SEED_SOCKADDR outbound on TCP?
+          * is peer_min_preferred_outbound_count = 1 in $SERVER_TOML?
+            0 is the classic mistake here - the node then reaches no_sync before any
+            peer connects and can never re-enter sync on this chain.
+          * is the network itself producing blocks? check $EXPLORER_URL"
+	say "the node is not left running; re-run once the above is sorted"
 fi
 
 if [ "$WITH_SYSTEMD" = "1" ]; then

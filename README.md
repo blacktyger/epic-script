@@ -312,9 +312,44 @@ and is quietly useless.
 | `only_randomx = true` | Your node **rejects every block on the chain** with `InvalidSortAlgo`. This network runs a 100% RandomX block policy, and nothing in a block header announces that, so every node and miner has to be configured identically. The `--onlyrandomx` CLI flag is parsed and then discarded — only the TOML field works. |
 | `chain_type = "Floonet"` | A config file's `chain_type` overrides the `--floonet` flag, and it defaults to `Mainnet` under serde when absent. A "floonet" node then quietly uses mainnet rules and the mainnet data directory. |
 | `seeding_type` + `seeds` | `floonet.epiccash.com`, floonet's only hardcoded DNS seed, has never existed — the Epic source carries the comment `does not exist yet` beside it — so `DNSSeed` resolves nothing and there is no way onto the chain. |
-| `peer_min_preferred_outbound_count = 0` | The sync loop's first action each iteration is: if fewer than this many **outbound** peers, set `AwaitingPeers` and `continue`. The default is 4. A test network has one seed, so a joining node reaches exactly 1 outbound peer, never satisfies the check, and sits in `awaiting_peers` forever without ever reaching the branch that sets `NoSync`. The stratum server then never serves work and the whole thing looks broken for no visible reason. |
+| `peer_min_preferred_outbound_count = 1` | The sync loop's first action each iteration is: if fewer than this many **outbound** peers, set `AwaitingPeers` and `continue`. The default is 4. A test network has one seed, so a joining node reaches exactly 1 outbound peer, never satisfies the check, and sits in `awaiting_peers` forever without ever reaching the branch that sets `NoSync`. The stratum server then never serves work and the whole thing looks broken for no visible reason. **Use 1, not 0** — see below. |
 | `enable_stratum_server = true` | The miner has nothing to connect to. |
 | `burn_reward = true` | The node blocks block production entirely while it fails to reach a wallet, retrying every 5 seconds. |
+
+### Why `peer_min_preferred_outbound_count = 1` and not `0`
+
+`0` looks like the safe answer — no peers required, guard always passes — and it is worse
+than the default. With `0` the node reaches `NoSync` **before any peer connects**. From
+`NoSync`, `needs_syncing()` takes its other branch and only re-enables sync when
+
+```
+peer_difficulty > local_difficulty + sum(last 5 block difficulties)
+```
+
+Floonet's genesis seeds ProgPow at `2^26 = 67108864`, and a RandomX-only chain never
+meaningfully increments it — at height 203 the seed offers ProgPow `67109067`, only 203
+above genesis — while the threshold is roughly twice the genesis value. That margin is never
+reached, so the node handshakes, holds a healthy connection, logs that the seed has more
+work, and **sits at height 0 forever**.
+
+It is worse under this script than on a plain node, because `burn_reward = true` means a
+stranded node still mines: it builds its own chain from genesis instead of following the
+network.
+
+`1` keeps the node in its startup `AwaitingPeers` state until the first peer connects, so
+`needs_syncing()` takes the `is_syncing` branch, sees the seed ahead, and syncs normally.
+
+Measured against the public seed on a fresh data directory:
+
+| Value | Result |
+|---|---|
+| `0` | healthy connection to the seed, saw its higher difficulty, **stuck at height 0** |
+| `1` | **synced genesis → tip** |
+
+`floonet.sh` verifies this after configuring: it polls its own `/v1/status` while the node
+is running and reports a failure if the height never leaves 0. Every other check — block
+policy, API, stratum, seed dial — passes on a node that never syncs a block, so that height
+check is the one that catches this class of mistake.
 
 `seeds` takes **`IP:port` only.** It deserialises to `Vec<PeerAddr>` wrapping a
 `std::net::SocketAddr`, which does not parse hostnames — and this is not ignored or warned
