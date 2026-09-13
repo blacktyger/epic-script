@@ -589,6 +589,105 @@ check_cmake_empty_target() {
 	say "cmake: $(cmake --version | head -n 1) rejects an empty build target"
 }
 
+# ---------------------------------------------------------------------------
+# CMake policy floor.
+#
+# CMake 4.0 removed compatibility with projects that either declare
+# `cmake_minimum_required(VERSION <3.5)` or omit the command entirely. Several
+# CMakeLists.txt files vendored through Epic's submodules do exactly that, so the
+# same source that builds on CMake 3.x fails on CMake 4.x with:
+#
+#   CMake Error in CMakeLists.txt:
+#     No cmake_minimum_required command is present.
+#
+# Observed on a stock CMake 4.2 host, in randomx-rust/randomx (none at all) and in
+# cuckoo-miner's plugin project (3.2). progpow-rust has seven more with none, which
+# affects the NODE build as well as the miner.
+#
+# Rather than pin versions or special-case each file, normalise every CMakeLists.txt
+# we are about to compile so it declares at least CMAKE_MIN_FLOOR. That is a no-op on
+# older CMake, since the floor is below what any supported CMake requires, and it is
+# idempotent, so re-running is harmless. Purely additive: no project logic is touched,
+# only the declared minimum.
+CMAKE_MIN_FLOOR="3.5"
+
+# true (0) when $1 is a lower version than $2. Numeric per component, no sort -V
+# dependency, so it behaves the same on GNU and BSD userlands.
+_cmake_ver_lt() {
+	[ "$(awk -v a="$1" -v b="$2" 'BEGIN{
+		na = split(a, A, "."); nb = split(b, B, ".")
+		n = (na > nb ? na : nb)
+		for (i = 1; i <= n; i++) {
+			x = (i <= na ? A[i] + 0 : 0); y = (i <= nb ? B[i] + 0 : 0)
+			if (x < y) { print 1; exit }
+			if (x > y) { print 0; exit }
+		}
+		print 0
+	}')" = "1" ]
+}
+
+# Ensure one CMakeLists.txt declares at least CMAKE_MIN_FLOOR. Echoes a short reason
+# when it changed the file, nothing when it was already fine.
+_cmake_floor_one() {
+	_f="$1"
+	[ -f "$_f" ] && [ -w "$_f" ] || return 0
+
+	_have=$(grep -m1 -ioE 'cmake_minimum_required[[:space:]]*\([[:space:]]*VERSION[[:space:]]*[0-9]+(\.[0-9]+)*' "$_f" 2>/dev/null |
+		grep -oE '[0-9]+(\.[0-9]+)*$')
+
+	if [ -z "$_have" ]; then
+		# No declaration at all. Prepend one; it must precede project().
+		{
+			printf 'cmake_minimum_required(VERSION %s)\n' "$CMAKE_MIN_FLOOR"
+			cat "$_f"
+		} >"$WORK_TMP/cmakelists.new" 2>/dev/null || return 0
+		cp "$WORK_TMP/cmakelists.new" "$_f" 2>/dev/null || return 0
+		printf 'added VERSION %s\n' "$CMAKE_MIN_FLOOR"
+		return 0
+	fi
+
+	_cmake_ver_lt "$_have" "$CMAKE_MIN_FLOOR" || return 0
+
+	# Declared but too low. Rewrite the version token on the first occurrence only,
+	# leaving anything else on the line (FATAL_ERROR, ranges) intact.
+	awk -v floor="$CMAKE_MIN_FLOOR" '
+		BEGIN { done = 0 }
+		{
+			if (!done && tolower($0) ~ /cmake_minimum_required[ \t]*\([ \t]*version/) {
+				if (match($0, /[0-9]+(\.[0-9]+)*/)) {
+					$0 = substr($0, 1, RSTART - 1) floor substr($0, RSTART + RLENGTH)
+				}
+				done = 1
+			}
+			print
+		}
+	' "$_f" >"$WORK_TMP/cmakelists.new" 2>/dev/null || return 0
+	cp "$WORK_TMP/cmakelists.new" "$_f" 2>/dev/null || return 0
+	printf 'raised %s -> %s\n' "$_have" "$CMAKE_MIN_FLOOR"
+}
+
+# Walk a directory and normalise every CMakeLists.txt under it.
+cmake_floor_tree() {
+	_root="$1"
+	_label="$2"
+	[ -d "$_root" ] || return 0
+
+	_n=0
+	# No process substitution, and no pipeline, so the counter survives in POSIX sh.
+	for _f in $(find "$_root" -name CMakeLists.txt -not -path '*/target/*' 2>/dev/null); do
+		_why=$(_cmake_floor_one "$_f")
+		if [ -n "$_why" ]; then
+			_n=$((_n + 1))
+			[ "$_n" -le 12 ] && detail "$(printf '%s  (%s)' "${_f#"$_root"/}" "$_why")"
+		fi
+	done
+
+	if [ "$_n" -gt 0 ]; then
+		[ "$_n" -gt 12 ] && detail "... and $((_n - 12)) more"
+		ok "$_label: set a CMake minimum on $_n file(s) so they build on CMake 4.x"
+	fi
+}
+
 # Replace `.build_target("")` with `.no_build_target(true)` in the miner's two build scripts.
 #
 # This is the only place the installer changes source before compiling it, so it is disclosed
@@ -935,6 +1034,18 @@ run_cargo_build() {
 
 build_node() {
 	fetch_source "$NODE_REPO" "$NODE_DIR" "$NODE_REF" "no"
+
+	# The node compiles randomx and progpow from source through their build scripts, and
+	# progpow-rust vendors seven CMakeLists.txt with no cmake_minimum_required at all, so
+	# the node build fails on CMake 4.x for the same reason the miner does. Fetch the git
+	# dependencies first so their checkouts exist, then normalise them.
+	cmake_floor_tree "$SRC_DIR/$NODE_DIR" "node sources"
+	(cd "$SRC_DIR/$NODE_DIR" && cargo fetch) >/dev/null 2>&1 || true
+	_cargo_git="${CARGO_HOME:-$HOME/.cargo}/git/checkouts"
+	for _d in "$_cargo_git"/progpow-rust-* "$_cargo_git"/randomx-rust-*; do
+		[ -d "$_d" ] && cmake_floor_tree "$_d" "$(basename "$_d" | sed 's/-[0-9a-f]\{16\}$//')"
+	done
+
 	if [ "$WITH_TOR" = "1" ]; then
 		run_cargo_build "$SRC_DIR/$NODE_DIR" node --features with-tor
 	else
@@ -958,6 +1069,11 @@ build_miner() {
 	if [ "$CMAKE_NEEDS_PATCH" = "1" ]; then
 		patch_cmake_build_scripts
 	fi
+
+	# Same reason as in build_node, and this is where it bites first: randomx-rust/randomx
+	# ships no cmake_minimum_required, and cuckoo-miner's plugin project declares 3.2.
+	# Both are fatal on CMake 4.x. Runs after the checkout, which resets the working tree.
+	cmake_floor_tree "$SRC_DIR/$MINER_DIR" "miner sources"
 
 	case "$MINER_FEATURES" in
 	cpu)

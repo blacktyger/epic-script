@@ -316,6 +316,36 @@ and is quietly useless.
 | `enable_stratum_server = true` | The miner has nothing to connect to. |
 | `burn_reward = true` | The node blocks block production entirely while it fails to reach a wallet, retrying every 5 seconds. |
 
+### CMake 4.x
+
+CMake 4.0 removed compatibility with projects that declare
+`cmake_minimum_required(VERSION <3.5)` or omit the command altogether. Several
+CMakeLists.txt files vendored through Epic's submodules do exactly that, so source that
+builds on CMake 3.x fails on CMake 4.x:
+
+```
+CMake Error in CMakeLists.txt:
+  No cmake_minimum_required command is present.
+```
+
+Ten such files exist across the trees the installer compiles — `randomx-rust/randomx`
+declares none, `cuckoo-miner`'s plugin project declares 3.2, and `progpow-rust` has
+seven with none plus one at 3.3. `progpow-rust` is a dependency of the **node**, not
+just the miner, so both builds are affected.
+
+`install.sh` normalises this rather than pinning versions: before each build it walks
+the source tree, and the relevant `~/.cargo/git/checkouts` directories, and ensures
+every `CMakeLists.txt` declares at least `VERSION 3.5`. Files that already do are left
+alone. It is additive — only the declared minimum changes, never project logic — and
+idempotent, so re-running is harmless. On CMake 3.x it is a no-op, since 3.5 is below
+what any supported CMake requires.
+
+It reports what it touched:
+
+```
+✓ miner sources: set a CMake minimum on 2 file(s) so they build on CMake 4.x
+```
+
 ### Why `peer_min_preferred_outbound_count = 1` and not `0`
 
 `0` looks like the safe answer — no peers required, guard always passes — and it is worse
