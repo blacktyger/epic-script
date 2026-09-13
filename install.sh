@@ -884,7 +884,15 @@ want_miner() {
 # because nobody needs the full history to compile a tag.
 # Paths this installer modifies inside a checkout itself. Excluded from the uncommitted-changes
 # check below, or the miner's own cmake fix would look like the user's work on every rerun.
-INSTALLER_PATCHED_PATHS="cuckoo-miner/src/build.rs randomx-rust/build.rs"
+# Paths this installer edits itself, so a re-run does not mistake its own work for the
+# user's. Note the bare submodule paths: the installer patches files *inside* vendored
+# submodules (build.rs, and CMakeLists.txt via cmake_floor_tree), and the superproject
+# reports a dirty submodule as the submodule directory alone -- "randomx-rust", not
+# "randomx-rust/build.rs". Without the directory entries here, one successful run dirties
+# a submodule and every later run refuses to continue with
+# "has uncommitted changes to tracked files: randomx-rust".
+INSTALLER_PATCHED_PATHS="cuckoo-miner/src/build.rs randomx-rust/build.rs
+randomx-rust progpow-rust cuckoo-miner/src/cuckoo_sys/plugins/cuckoo"
 
 # Refuse to throw away work that is not ours.
 #
@@ -899,7 +907,11 @@ assert_checkout_is_clean() {
 	_dir="$1"
 	_name="$2"
 
-	_dirty="$(git -C "$_dir" status --porcelain --untracked-files=no 2>/dev/null || true)"
+	# --ignore-submodules=dirty: report a submodule only when the superproject's recorded
+	# commit changed, not when its working tree differs. Content changes inside vendored
+	# submodules are this installer's own patches, and are re-applied on every run.
+	_dirty="$(git -C "$_dir" status --porcelain --untracked-files=no \
+		--ignore-submodules=dirty 2>/dev/null || true)"
 	[ -n "$_dirty" ] || return 0
 
 	# Drop our own edits from the list, then see whether anything is left.
