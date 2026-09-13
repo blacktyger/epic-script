@@ -30,7 +30,7 @@
 
 set -u
 
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.0.1"
 
 # ---------------------------------------------------------------------------
 # Pinned upstream sources.
@@ -907,11 +907,20 @@ assert_checkout_is_clean() {
 	_dir="$1"
 	_name="$2"
 
-	# --ignore-submodules=dirty: report a submodule only when the superproject's recorded
-	# commit changed, not when its working tree differs. Content changes inside vendored
-	# submodules are this installer's own patches, and are re-applied on every run.
+	# --ignore-submodules=all, not =dirty. Verified against a synthetic superproject:
+	#
+	#   submodule work tree modified   -> =dirty suppresses it, =all suppresses it
+	#   submodule HEAD off the record  -> =dirty STILL REPORTS " M sub", only =all suppresses
+	#
+	# Both states are produced by this installer. It patches files inside vendored submodules,
+	# and its update path runs `git submodule update --init --recursive`, which moves submodule
+	# HEADs to whatever the superproject records - so a superproject ref change relocates them.
+	# There is nothing of the user's to protect inside a vendored submodule: the update resets
+	# them on every run regardless. Suppress them entirely.
+	#
+	# The superproject's own tracked files are still checked, which is what this guard is for.
 	_dirty="$(git -C "$_dir" status --porcelain --untracked-files=no \
-		--ignore-submodules=dirty 2>/dev/null || true)"
+		--ignore-submodules=all 2>/dev/null || true)"
 	[ -n "$_dirty" ] || return 0
 
 	# Drop our own edits from the list, then see whether anything is left.
