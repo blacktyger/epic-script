@@ -280,6 +280,112 @@ firing and nothing is patched.
 There has never been a published miner binary for any platform, and mining plugins exist only for
 Linux x86-64 and macOS. A stock Windows build is RandomX only.
 
+## Floonet
+
+`install.sh` builds mainnet binaries. `floonet.sh` takes those binaries and joins the
+**floonet test network** as a mining node — no wallet, nothing to set up, nothing to lose.
+
+Linux only, deliberately: the mining plugins and the RandomX light-mode path are only exercised
+on Linux x86-64, and a test network is not the place to debug three platforms.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/blacktyger/epic-script/main/floonet.sh | sh -s -- --yes
+```
+
+Read it first, or see what it would do and change nothing:
+
+```sh
+curl -fsSL .../floonet.sh | less
+curl -fsSL .../floonet.sh | sh -s -- --check
+```
+
+It delegates every build to `install.sh`, so there is one source of truth for compiling, and
+then does the floonet part.
+
+### Why a mainnet config does not just work
+
+Six changes, each of which is load-bearing. Five of the six produce a node that appears to run
+and is quietly useless.
+
+| Setting | Without it |
+|---|---|
+| `only_randomx = true` | Your node **rejects every block on the chain** with `InvalidSortAlgo`. This network runs a 100% RandomX block policy, and nothing in a block header announces that, so every node and miner has to be configured identically. The `--onlyrandomx` CLI flag is parsed and then discarded — only the TOML field works. |
+| `chain_type = "Floonet"` | A config file's `chain_type` overrides the `--floonet` flag, and it defaults to `Mainnet` under serde when absent. A "floonet" node then quietly uses mainnet rules and the mainnet data directory. |
+| `seeding_type` + `seeds` | `floonet.epiccash.com`, floonet's only hardcoded DNS seed, has never existed — the Epic source carries the comment `does not exist yet` beside it — so `DNSSeed` resolves nothing and there is no way onto the chain. |
+| `peer_min_preferred_outbound_count = 0` | The sync loop's first action each iteration is: if fewer than this many **outbound** peers, set `AwaitingPeers` and `continue`. The default is 4. A test network has one seed, so a joining node reaches exactly 1 outbound peer, never satisfies the check, and sits in `awaiting_peers` forever without ever reaching the branch that sets `NoSync`. The stratum server then never serves work and the whole thing looks broken for no visible reason. |
+| `enable_stratum_server = true` | The miner has nothing to connect to. |
+| `burn_reward = true` | The node blocks block production entirely while it fails to reach a wallet, retrying every 5 seconds. |
+
+`seeds` takes **`IP:port` only.** It deserialises to `Vec<PeerAddr>` wrapping a
+`std::net::SocketAddr`, which does not parse hostnames — and this is not ignored or warned
+about, it panics the node on startup with `invalid socket address syntax`. Any guide that
+prints a hostname there produces a node that will not start. `floonet.sh` resolves the seed
+before writing it.
+
+### Mining with no wallet
+
+`burn_reward = true` makes the node mint each coinbase to a throwaway `ExtKeychain` it
+generates on the spot. Blocks are produced and fully valid; the reward is simply unspendable by
+anyone. You are contributing hashrate and testing consensus, not accumulating. Add a wallet
+later with `install.sh --component wallet` if you want the coins.
+
+This is why no wallet is installed, and it also sidesteps a genuine bootstrap deadlock:
+`epic-wallet listen` refuses to start unless the node reports synced, and the node needs the
+wallet to build a coinbase for every block. `burn_reward` cuts that loop.
+
+### RandomX light mode
+
+The one place `floonet.sh` touches source, and the reason it exists as more than a config
+script.
+
+`randomx-miner` hardcodes `rx_state.full_mem = true` — RandomX **fast** mode — with no
+configuration path to turn it off, and calls `init_dataset()` unconditionally so a config asking
+for light mode would still allocate. Fast mode wants a ~2080 MB dataset per epoch and the miner
+pre-builds the next epoch too, so peak approaches **4 GB**.
+
+On a machine with several spare gigabytes that is simply fast. On a small VPS it is an
+out-of-memory kill, and the kernel picks the largest resident process, which is not necessarily
+the miner. This exact failure killed a live mainnet node on the machine the script was developed
+on.
+
+So `floonet.sh` probes the miner source for a `full_mem` option. If the fork has grown one it
+does nothing. If not it shows the change and asks before applying it, then rebuilds — the same
+contract as the CMake patch above, and it disappears on its own once the fix lands upstream.
+Light mode is ~256 MB per thread, and the thread count defaults to whatever fits in available
+memory rather than to core count.
+
+### Options
+
+| Option | Variable | Meaning |
+|---|---|---|
+| `--check` | `FLOONET_CHECK` | preflight only, change nothing |
+| `--yes` | `FLOONET_YES` | answer yes up front; required when piping |
+| `--install-deps` | `FLOONET_INSTALL_DEPS` | let the build install missing packages |
+| `--threads <n>` | `FLOONET_THREADS` | mining threads. Default: from available memory |
+| `--jobs <n>` | `FLOONET_JOBS` | parallel build jobs |
+| `--systemd` | `FLOONET_SYSTEMD` | write systemd `--user` units, memory-capped |
+| `--skip-build` | `FLOONET_SKIP_BUILD` | configure only, binaries already present |
+| `--no-patch-miner` | `FLOONET_NO_PATCH_MINER` | refuse the light-mode patch |
+| `--seed <host:port>` | `FLOONET_SEED` | seed node. Default `floo-node.btlabs.uk:13414` |
+
+### It verifies rather than assuming
+
+The last step starts the node and waits for it to report a 100% RandomX block policy, an API
+listener, a stratum server and a dial to the seed. If the policy does not appear it **fails**
+and prints the log tail, because a config the node silently disagrees with is the failure mode
+worth catching — writing a file is not evidence that it worked.
+
+### What to expect once running
+
+Blocks arrive every few seconds below height 200 and much more slowly afterwards. That is
+expected, not a fault: floonet hardcodes difficulty to **1** below height 200 —
+`next_difficulty` opens with an unconditional early return for floonet — and starts real
+retargeting at 200 with a RandomX floor of 4000. Observed on the live chain: difficulty 1 at
+height 199, 4000 at height 200. A 4000× step in a single block.
+
+Check your node against the network at **https://floo-explorer.btlabs.uk**, or
+`curl -s https://floo-explorer.btlabs.uk/api/summary`.
+
 ## Notes for the curious
 
 Things found while building this that are worth knowing:
