@@ -722,6 +722,30 @@ toml_set "$SERVER_TOML" "server.p2p_config" "port" "$P2P_PORT"
 #    Measured against the public seed: 0 -> stuck at height 0; 1 -> synced genesis to tip.
 toml_set "$SERVER_TOML" "server.p2p_config" "peer_min_preferred_outbound_count" "1"
 
+# 4b. ban_window. The default is 10800 seconds - three hours.
+#     The node bans a source IP on ANY handshake error, labels every one of them
+#     BadHandshake regardless of the real cause, and thereafter refuses that IP before
+#     the handshake even starts. Verified on a live seed: opening a TCP connection to the
+#     P2P port and closing it without sending anything is enough to earn the ban. So a
+#     port scan, an uptime check, or a node killed mid-handshake locks a host out for
+#     three hours - and the ban matches on IP, not IP:port, so one bad probe from a NAT
+#     gateway takes out every node behind it.
+#
+#     On a small test network trying to attract peers that trade is backwards: a stale
+#     ban costs far more than a re-handshake. 30 seconds keeps the brake against a peer
+#     that is genuinely misbehaving while letting an accident heal itself.
+toml_set "$SERVER_TOML" "server.p2p_config" "ban_window" "30"
+
+# 4c. Debug logging to file, on by default.
+#     Every handshake rejection is reported as BadHandshake and the ACTUAL reason -
+#     GenesisMismatch, PeerWithSelf, a protocol mismatch, or simply nothing sent - is
+#     logged at debug! only. At the default stdout level those failures are invisible,
+#     which turns "my node will not connect" into guesswork. This is a test network whose
+#     purpose is diagnosing exactly that, so pay the disk for it. The file rotates at
+#     log_max_size, so it does not grow without bound.
+toml_set "$SERVER_TOML" "logging" "log_to_file" "true"
+toml_set "$SERVER_TOML" "logging" "file_log_level" '"DEBUG"'
+
 # 5/6. Stratum, and mining with no wallet.
 #    burn_reward = true makes the node pass None as the wallet listener URL, which routes
 #    coinbase creation to burn_reward(): a throwaway ExtKeychain generated on the spot. Blocks
@@ -913,13 +937,22 @@ if [ "$_ok_sync" = "1" ]; then
 elif [ -r "$_secret_file" ]; then
 	printf '\n'
 	warn "the node started cleanly but is still at height 0 - it is not following the chain"
-	say "Everything else verified, so this is almost certainly connectivity or the sync
-        threshold rather than your build:
+	say "Everything else verified, so this is connectivity, a ban, or the sync threshold
+        rather than your build:
+          * BANNED BY THE SEED. If the log repeats \"Connecting to seed and preferred
+            peers address\" while peers stay at 0/0/0, the seed is refusing this host.
+            The node bans a source IP on any handshake error and then rejects it before
+            the handshake starts, so a port scan from this address, or a node killed
+            mid-handshake, is enough. Verified: opening a TCP connection to the P2P port
+            and closing it without sending anything earns the ban. It matches on IP, not
+            IP:port. Wait out the seed's ban_window, or ask its operator to unban you.
           * can this host reach $SEED_SOCKADDR outbound on TCP?
           * is peer_min_preferred_outbound_count = 1 in $SERVER_TOML?
             0 is the classic mistake here - the node then reaches no_sync before any
             peer connects and can never re-enter sync on this chain.
-          * is the network itself producing blocks? check $EXPLORER_URL"
+          * is the network itself producing blocks? check $EXPLORER_URL
+        The debug log this script enables records the real handshake error, which is
+        otherwise only ever reported as the generic BadHandshake."
 	say "the node is not left running; re-run once the above is sorted"
 fi
 
